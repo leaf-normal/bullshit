@@ -9,11 +9,11 @@ struct Material {
   float roughness;
   float metallic;
 
-  float3 emission;        // 自发光颜色
-  float ior;                // 折射率
-  float transparency;        
-  int material_type;        // 材质类型: 0=漫反射, 1=镜面, 2=玻璃, 3=发射
-  int texture_id;       
+  // float3 emission;        // 自发光颜色
+  // float ior;                // 折射率
+  // float transparency;        
+  // int material_type;        // 材质类型: 0=漫反射, 1=镜面, 2=玻璃, 3=发射
+  // int texture_id;       
 };
 
 struct HoverInfo {
@@ -29,6 +29,21 @@ RWTexture2D<int> entity_id_output : register(u0, space5);
 RWTexture2D<float4> accumulated_color : register(u0, space6);
 RWTexture2D<int> accumulated_samples : register(u0, space7);
 
+// *add
+struct GeometryDescriptor {
+    uint vertex_offset;
+    uint normal_offset;
+    uint index_offset;
+    uint vertex_count;
+    uint index_count;
+    uint material_index;
+};
+
+// *add
+StructuredBuffer<GeometryDescriptor> geometry_descriptors : register(t0, space8);
+StructuredBuffer<float3> vertex_positions : register(t1, space8);
+StructuredBuffer<uint> indices : register(t2, space8);
+
 struct RayPayload {
   float3 color;
   bool hit;
@@ -37,7 +52,7 @@ struct RayPayload {
   float3 hit_point;
 };
 
-#define MAX_DEPTH 8
+#define MAX_DEPTH 16
 #define RR_THRESHOLD 0.9f
 #define t_min 0.001
 #define t_max 10000.0
@@ -80,7 +95,6 @@ void SampleBSDF(Material material, float3 ray, float3 normal, out float3 wi, out
 
   int seed = pixel_coords[0] * pixel_coords[1];
 
-  int depth = 0;
   float3 color = float3(0.0, 0.0, 0.0);
   float3 throughout = float3(1.0, 1.0, 1.0);
 
@@ -92,52 +106,56 @@ void SampleBSDF(Material material, float3 ray, float3 normal, out float3 wi, out
 
   entity_id_output[pixel_coords] =  -1;
 
-  while(1){
-    ++depth;
+  for(int depth = 0; depth < MAX_DEPTH; ++depth){
 
     RayPayload payload;
     payload.color = float3(0, 0, 0);
     payload.hit = false;
     payload.instance_id = 0;
 
-    TraceRay(as, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
-
+    TraceRay(as, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload); // direction of ray should always be normalized
+        
     if(!payload.hit){
-      color = payload.color * throughout;
+      color += payload.color * throughout;
       break;
     }
 
-    if(depth == 1){
+    if(depth == 0){
       // Write entity ID to the ID buffer
       // If no hit, write -1; otherwise write the instance ID
       entity_id_output[pixel_coords] = (int)payload.instance_id;
     }
 
+    Material mat = materials[payload.instance_id];
+    
+    if (mat.metallic < 0.5){
+      color += payload.color * throughout;
+      break; 
+    }
+
     if(depth > 4){
       float p_survive = min(f3_max(throughout), RR_THRESHOLD);
       if(random(seed) > p_survive){
-        //
         break;
       }
       throughout /= p_survive;
 
     }
+    // color += throughout * material.emission;
 
-    Material material = materials[payload.instance_id];
+    // float pdf, wi;
+    // float3 bsdf = SampleBSDF(mat, -ray.Direction, payload.normal, wi, pdf, seed);
 
-    color += throughout * material.emission;
+    // if(pdf <= 0.0) break;
 
-    float pdf, wi;
-    float3 bsdf = SampleBSDF(material, -ray.Direction, payload.normal, wi, pdf, seed);
+    // float cosTheta = dot(wi, payload.normal);
 
-    if(pdf <= 0.0) break;
+    // throughout *= bsdf * abs(cosTheta) / pdf;
 
-    float cosTheta = dot(wi, payload.normal);
+    throughout *= mat.base_color;
 
-    throughout *= bsdf * abs(cosTheta) / pdf;
-
-    ray.Origin = payload.hit_point + (cosTheta > 0 ? eps : -eps) * payload.normal;
-    ray.Direction = wi;
+    ray.Origin = payload.hit_point + eps * payload.normal;
+    ray.Direction = normalize( reflect(-ray.Direction, payload.normal) );
     ray.TMin = t_min;
     ray.TMax = t_max;
 
@@ -164,22 +182,64 @@ void SampleBSDF(Material material, float3 ray, float3 normal, out float3 wi, out
 }
 
 [shader("closesthit")] void ClosestHitMain(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {
+  // *add, all below is modified
+
   payload.hit = true;
   
-  // Get material index from instance
-  uint material_idx = InstanceID();
-  payload.instance_id = material_idx;
+  // 1. 获取实例ID和基元ID
+  uint instance_id = InstanceID();
+  uint primitive_id = PrimitiveIndex();
+  payload.instance_id = instance_id;
   
-  // Load material
-  Material mat = materials[material_idx];
+  // 3. 获取几何描述符
+  GeometryDescriptor geo_desc = geometry_descriptors[instance_id];
   
-  // Simple diffuse lighting
-  float3 world_normal = normalize(float3(0, 1, 0)); // Placeholder, should compute from geometry
-  float3 light_dir = normalize(float3(1, 1, 1));
-  float ndotl = max(0.0, dot(world_normal, light_dir));
+  // 4. 计算世界空间命中点
+  float3 ray_origin = WorldRayOrigin();
+  float3 ray_direction = WorldRayDirection();
+  float hit_distance = RayTCurrent();
+  payload.hit_point = ray_origin + hit_distance * ray_direction;
   
-  // Apply material color (NO hover highlighting here - done in post-process)
-  float3 diffuse = mat.base_color * (0.3 + 0.7 * ndotl);
+  // 5. 获取三角形顶点索引
+  uint index_offset = geo_desc.index_offset + primitive_id * 3;
+  uint i0 = indices[index_offset];
+  uint i1 = indices[index_offset + 1];
+  uint i2 = indices[index_offset + 2];
   
-  payload.color = diffuse;
+  // 6. 获取顶点位置（用于精确命中点计算）
+  float3 v0 = vertex_positions[geo_desc.vertex_offset + i0];
+  float3 v1 = vertex_positions[geo_desc.vertex_offset + i1];
+  float3 v2 = vertex_positions[geo_desc.vertex_offset + i2];
+
+  payload.normal = normalize( mul( (float3x3)transpose( WorldToObject4x3() ), cross(v1 - v0, v2 - v0) ) );
+
+  if(dot(payload.normal, ray_direction) > 0){
+    payload.normal = - payload.normal;
+  }
+
+  Material mat = materials[instance_id];
+  
+  // 对于非金属，计算直接光照
+  if (mat.metallic < 0.5) {
+    float3 light_dir = normalize(float3(1, 2, 1));  // 简单的方向光
+    float3 view_dir = -ray_direction;
+    
+    // 漫反射分量
+    float ndotl = max(0.0, dot(payload.normal, light_dir));
+    float3 diffuse = mat.base_color * ndotl;
+    
+    // 环境光分量
+    float3 ambient = mat.base_color * 0.05;
+    
+    // 简单的镜面反射（基于粗糙度）
+    float3 reflect_dir = reflect(-light_dir, payload.normal);
+    float spec = pow(max(0.0, dot(view_dir, reflect_dir)), 32.0 * (1.0 - mat.roughness));
+    float3 specular = float3(0.3, 0.3, 0.3) * spec * (1.0 - mat.roughness);
+    
+    // 将计算出的直接光照结果存入 payload
+    payload.color = ambient + diffuse + specular;
+  }
+  else {
+    payload.color = float3(0.0 ,0.0, 0.0);
+  }
 }

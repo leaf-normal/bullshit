@@ -185,7 +185,7 @@ void Application::OnMouseButton(int button, int action, int mods, double xpos, d
 
 void Application::OnInit() {
     alive_ = true;
-    core_->CreateWindowObject(1280, 720,
+    core_->CreateWindowObject(2560, 1440,
         ((core_->API() == grassland::graphics::BACKEND_API_VULKAN) ? "[Vulkan]" : "[D3D12]") +
         std::string(" Ray Tracing Scene Demo"),
         &window_);
@@ -325,6 +325,12 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space5 - entity ID output
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space6 - accumulated color
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space7 - accumulated samples
+
+    // *add geometry
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - geometry descriptors
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - vertex positions  
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - indices    
+
     program_->Finalize();
 }
 
@@ -794,6 +800,14 @@ void Application::OnRender() {
     command_context->CmdBindResources(5, { entity_id_image_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(6, { film_->GetAccumulatedColorImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(7, { film_->GetAccumulatedSamplesImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
+    
+    // *add
+    command_context->CmdBindResources(8, { 
+        scene_->GetGeometryDescriptorsBuffer(),
+        scene_->GetVertexBuffer(), 
+        scene_->GetIndexBuffer()
+    }, grassland::graphics::BIND_POINT_RAYTRACING);
+    
     command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
     
     // When camera is disabled, increment sample count and use accumulated image

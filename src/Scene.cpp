@@ -62,6 +62,9 @@ void Scene::BuildAccelerationStructures() {
 
     // Update materials buffer
     UpdateMaterialsBuffer();
+
+    // *add
+    BuildGeometryBuffers();
 }
 
 void Scene::UpdateInstances() {
@@ -118,5 +121,98 @@ void Scene::UpdateMaterialsBuffer() {
     
     materials_buffer_->UploadData(materials.data(), buffer_size);
     grassland::LogInfo("Updated materials buffer with {} materials", materials.size());
+}
+
+// *add
+// 几何信息 Buffer，静态
+
+struct GeometryDescriptor {
+    uint32_t vertex_offset;
+    uint32_t index_offset;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    uint32_t material_index;
+};
+
+void Scene::BuildGeometryBuffers() {
+    if (entities_.empty()) {
+        return;
+    }
+
+    size_t total_vertices = 0;
+    size_t total_indices = 0;
+
+    for (const auto& entity : entities_) {
+        total_vertices += entity->GetVertexCount();
+        total_indices += entity->GetIndexCount();
+    }
+
+    // 2. 创建几何描述符数组
+    std::vector<GeometryDescriptor> geometry_descriptors;
+    geometry_descriptors.reserve(entities_.size());
+
+    // 3. 创建合并的顶点/法线/索引数据
+    std::vector<glm::vec3> all_vertices;
+    std::vector<uint32_t> all_indices;
+    
+    all_vertices.reserve(total_vertices);
+    all_indices.reserve(total_indices);
+
+    // 4. 合并所有实体的几何数据
+    uint32_t vertex_offset = 0;
+    uint32_t index_offset = 0;
+
+    for (size_t i = 0; i < entities_.size(); ++i) {
+        const auto& entity = entities_[i];
+        
+        // 下载实体几何数据
+        size_t vertex_count = entity->GetVertexCount();
+        size_t index_count = entity->GetIndexCount();
+
+        std::vector<glm::vec3> vertices(vertex_count);
+        std::vector<glm::vec3> normals(vertex_count);
+        std::vector<uint32_t> indices(index_count);
+
+        entity->GetVertexBuffer()->DownloadData(vertices.data());
+        entity->GetIndexBuffer()->DownloadData(indices.data());
+
+        // 添加到全局缓冲区
+        all_vertices.insert(all_vertices.end(), vertices.begin(), vertices.end());
+        
+        // 调整索引（加上当前偏移）
+        for (auto index : indices) {
+            all_indices.push_back(index + vertex_offset);
+        }
+
+        // 创建几何描述符
+        GeometryDescriptor desc{};
+        desc.vertex_offset = vertex_offset;
+        desc.index_offset = index_offset;
+        desc.vertex_count = static_cast<uint32_t>(vertex_count);
+        desc.index_count = static_cast<uint32_t>(index_count);
+        desc.material_index = static_cast<uint32_t>(i);
+        
+        geometry_descriptors.push_back(desc);
+
+        vertex_offset += vertex_count;
+        index_offset += index_count;
+    }
+
+    // 5. 创建GPU缓冲区
+    size_t vertex_buffer_size = all_vertices.size() * sizeof(glm::vec3);
+    size_t index_buffer_size = all_indices.size() * sizeof(uint32_t);
+    size_t descriptors_size = geometry_descriptors.size() * sizeof(GeometryDescriptor);
+
+    core_->CreateBuffer(vertex_buffer_size, grassland::graphics::BUFFER_TYPE_DYNAMIC, &global_vertex_buffer_);
+    core_->CreateBuffer(index_buffer_size, grassland::graphics::BUFFER_TYPE_DYNAMIC, &global_index_buffer_);
+    core_->CreateBuffer(descriptors_size, grassland::graphics::BUFFER_TYPE_DYNAMIC, &geometry_descriptors_buffer_);
+
+    // 6. 上传数据
+    global_vertex_buffer_->UploadData(all_vertices.data(), vertex_buffer_size);
+    global_index_buffer_->UploadData(all_indices.data(), index_buffer_size);
+    geometry_descriptors_buffer_->UploadData(geometry_descriptors.data(), descriptors_size);
+
+    grassland::LogInfo("Built geometry buffers: {} vertices, {} indices across {} entities",
+                      all_vertices.size(),  all_indices.size(), entities_.size());
 }
 

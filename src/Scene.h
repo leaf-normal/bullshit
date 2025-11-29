@@ -35,6 +35,12 @@ public:
     // Get number of entities
     size_t GetEntityCount() const { return entities_.size(); }
 
+    // *add
+    grassland::graphics::Buffer* GetVertexBuffer() const { return global_vertex_buffer_.get(); }
+    grassland::graphics::Buffer* GetIndexBuffer() const { return global_index_buffer_.get(); }
+    grassland::graphics::Buffer* GetGeometryDescriptorsBuffer() const { return geometry_descriptors_buffer_.get(); }
+
+
 private:
     void UpdateMaterialsBuffer();
 
@@ -42,5 +48,13 @@ private:
     std::vector<std::shared_ptr<Entity>> entities_;
     std::unique_ptr<grassland::graphics::AccelerationStructure> tlas_;
     std::unique_ptr<grassland::graphics::Buffer> materials_buffer_;
+
+    // *add
+    std::unique_ptr<grassland::graphics::Buffer> global_vertex_buffer_;
+    std::unique_ptr<grassland::graphics::Buffer> global_index_buffer_;
+    std::unique_ptr<grassland::graphics::Buffer> geometry_descriptors_buffer_;
+
+    void BuildGeometryBuffers();
+
 };
 
