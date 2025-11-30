@@ -95,6 +95,8 @@ void Scene::UpdateInstances() {
 
     // Update TLAS
     tlas_->UpdateInstances(instances);
+    
+    grassland::LogInfo("Updated TLAS with {} entities", entities_.size());    
 }
 
 void Scene::UpdateMaterialsBuffer() {
@@ -131,7 +133,6 @@ struct GeometryDescriptor {
     uint32_t index_offset;
     uint32_t vertex_count;
     uint32_t index_count;
-    uint32_t material_index;
 };
 
 void Scene::BuildGeometryBuffers() {
@@ -170,19 +171,16 @@ void Scene::BuildGeometryBuffers() {
         size_t index_count = entity->GetIndexCount();
 
         std::vector<glm::vec3> vertices(vertex_count);
-        std::vector<glm::vec3> normals(vertex_count);
         std::vector<uint32_t> indices(index_count);
 
-        entity->GetVertexBuffer()->DownloadData(vertices.data());
-        entity->GetIndexBuffer()->DownloadData(indices.data());
+        entity->GetVertexBuffer()->DownloadData(vertices.data(), vertices.size() * sizeof(glm::vec3));
+        entity->GetIndexBuffer()->DownloadData(indices.data(), indices.size() * sizeof(uint32_t));
 
         // 添加到全局缓冲区
         all_vertices.insert(all_vertices.end(), vertices.begin(), vertices.end());
         
         // 调整索引（加上当前偏移）
-        for (auto index : indices) {
-            all_indices.push_back(index + vertex_offset);
-        }
+        all_indices.insert(all_indices.end(), indices.begin(), indices.end());
 
         // 创建几何描述符
         GeometryDescriptor desc{};
@@ -190,7 +188,6 @@ void Scene::BuildGeometryBuffers() {
         desc.index_offset = index_offset;
         desc.vertex_count = static_cast<uint32_t>(vertex_count);
         desc.index_count = static_cast<uint32_t>(index_count);
-        desc.material_index = static_cast<uint32_t>(i);
         
         geometry_descriptors.push_back(desc);
 

@@ -236,7 +236,7 @@ void Application::OnInit() {
     {
         auto red_sphere = std::make_shared<Entity>(
             "meshes/octahedron.obj",
-            Material(glm::vec3(1.0f, 0.2f, 0.2f), 0.3f, 0.0f),
+            Material(glm::vec3(1.0f, 0.2f, 0.2f), 0.0f, 0.0f),
             glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
         );
         scene_->AddEntity(red_sphere);
@@ -245,8 +245,8 @@ void Application::OnInit() {
     // Green metallic sphere
     {
         auto green_sphere = std::make_shared<Entity>(
-            "meshes/octahedron.obj",
-            Material(glm::vec3(0.2f, 1.0f, 0.2f), 0.2f, 0.8f),
+            "meshes/preview_sphere.obj",
+            Material(glm::vec3(0.8f, 1.0f, 0.8f), 0.2f, 0.8f),
             glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
         );
         scene_->AddEntity(green_sphere);
@@ -314,9 +314,20 @@ void Application::OnInit() {
     core_->CreateShader(GetShaderCode("shaders/shader.hlsl"), "RayGenMain", "lib_6_3", &raygen_shader_);
     core_->CreateShader(GetShaderCode("shaders/shader.hlsl"), "MissMain", "lib_6_3", &miss_shader_);
     core_->CreateShader(GetShaderCode("shaders/shader.hlsl"), "ClosestHitMain", "lib_6_3", &closest_hit_shader_);
+    if (!raygen_shader_ || !miss_shader_ || !closest_hit_shader_) {
+        grassland::LogError("Failed to create one or more shaders");
+        alive_ = false;
+        return;
+    }
     grassland::LogInfo("Shader compiled successfully");
 
     core_->CreateRayTracingProgram(raygen_shader_.get(), miss_shader_.get(), closest_hit_shader_.get(), &program_);
+    if (!program_) {
+        grassland::LogError("Failed to create ray tracing program");
+        alive_ = false;
+        return;
+    }
+
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_ACCELERATION_STRUCTURE, 1);  // space0
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space1 - color output
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space2
@@ -331,7 +342,15 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - vertex positions  
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - indices    
 
-    program_->Finalize();
+    //program_->Finalize();
+    try {
+        program_->Finalize();
+        grassland::LogInfo("Ray tracing program finalized successfully");
+    } catch (const std::exception& e) {
+        grassland::LogError("Failed to finalize ray tracing program: {}", e.what());
+        alive_ = false;
+        return;
+    }    
 }
 
 void Application::OnClose() {
@@ -802,11 +821,9 @@ void Application::OnRender() {
     command_context->CmdBindResources(7, { film_->GetAccumulatedSamplesImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
     // *add
-    command_context->CmdBindResources(8, { 
-        scene_->GetGeometryDescriptorsBuffer(),
-        scene_->GetVertexBuffer(), 
-        scene_->GetIndexBuffer()
-    }, grassland::graphics::BIND_POINT_RAYTRACING);
+    command_context->CmdBindResources(8, { scene_->GetGeometryDescriptorsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
+    command_context->CmdBindResources(9, { scene_->GetVertexBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
+    command_context->CmdBindResources(10, { scene_->GetIndexBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
     command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
     
