@@ -17,7 +17,10 @@ namespace {
 #include "built_in_shaders.inl"
 }
 
-Application::Application(grassland::graphics::BackendAPI api) {
+Application::Application(grassland::graphics::BackendAPI api) 
+    : frame_count_(0)
+    , samples_per_pixel_(1) { // *add
+
     grassland::graphics::CreateCore(api, grassland::graphics::Core::Settings{}, &core_);
     core_->InitializeLogicalDeviceAutoSelect(true);
 
@@ -217,6 +220,16 @@ void Application::OnInit() {
     mouse_y_ = 0.0;
     // Don't grab cursor initially - user can right-click to enable camera mode
 
+    // *add, initial render settings
+    core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
+    
+    RenderSettings initial_settings{};
+    initial_settings.frame_count = 0;
+    initial_settings.samples_per_pixel = samples_per_pixel_;
+    initial_settings.max_depth = 8;
+    initial_settings.enable_accumulation = 1;
+    render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
+
     // Create scene
     scene_ = std::make_unique<Scene>(core_.get());
 
@@ -237,7 +250,7 @@ void Application::OnInit() {
         auto red_sphere = std::make_shared<Entity>(
             "meshes/octahedron.obj",
             Material(glm::vec3(1.0f, 0.2f, 0.2f), 0.0f, 0.0f),
-            glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
+                glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
         );
         scene_->AddEntity(red_sphere);
     }
@@ -246,8 +259,8 @@ void Application::OnInit() {
     {
         auto green_sphere = std::make_shared<Entity>(
             "meshes/preview_sphere.obj",
-            Material(glm::vec3(0.8f, 1.0f, 0.8f), 0.2f, 0.8f),
-            glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
+            Material(glm::vec3(0.8f, 0.95f, 0.8f), 0.2f, 0.8f),
+                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
         );
         scene_->AddEntity(green_sphere);
     }
@@ -339,9 +352,11 @@ void Application::OnInit() {
 
     // *add geometry
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - geometry descriptors
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - vertex positions  
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - indices    
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space9 - vertex infos 
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space10 - indices    
 
+    // *add render setting
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space 11 - render setting
     //program_->Finalize();
     try {
         program_->Finalize();
@@ -434,7 +449,23 @@ void Application::OnUpdate() {
     if (alive_) {
         // Process keyboard input to move camera
         ProcessInput();
+
+        if (!camera_enabled_) {
+            frame_count_++;
+            if( (frame_count_ & 7) == 0)
+                grassland::LogInfo("Processing frame {}",frame_count_);
+        } else {
+            frame_count_ = 0;
+        }
+    
+        RenderSettings settings{};
+        settings.frame_count = frame_count_;
+        settings.samples_per_pixel = samples_per_pixel_;
+        settings.max_depth = 8;
+        settings.enable_accumulation = !camera_enabled_;
         
+        render_settings_buffer_->UploadData(&settings, sizeof(RenderSettings));
+
         // Detect camera state change and reset accumulation if camera started moving
         if (camera_enabled_ != last_camera_enabled_) {
             if (camera_enabled_) {
@@ -824,6 +855,9 @@ void Application::OnRender() {
     command_context->CmdBindResources(8, { scene_->GetGeometryDescriptorsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(9, { scene_->GetVertexInfoBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(10, { scene_->GetIndexBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
+
+    // *add
+    command_context->CmdBindResources(11, { render_settings_buffer_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
     command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
     

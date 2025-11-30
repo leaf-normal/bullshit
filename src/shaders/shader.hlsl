@@ -47,6 +47,15 @@ StructuredBuffer<GeometryDescriptor> geometry_descriptors : register(t0, space8)
 StructuredBuffer<VertexInfo> vertices : register(t0, space9);
 StructuredBuffer<uint> indices : register(t0, space10);
 
+struct RenderSettings {  // Mainly for random seed
+    uint frame_count;
+    uint samples_per_pixel;
+    uint max_depth;
+    uint enable_accumulation;
+};
+
+ConstantBuffer<RenderSettings> render_setting : register(b0, space11);
+
 struct RayPayload {
   float3 color;
   bool hit;
@@ -61,19 +70,28 @@ struct RayPayload {
 #define t_max 10000.0
 #define eps 5e-4
 
-void wanghash(inout uint seed)
+// void wanghash(inout uint seed)
+// {
+//   seed=(seed^61)^(seed>>16);
+//   seed=seed*9;
+//   seed=seed^(seed>>4);
+//   seed=seed*0x27d4eb2d;
+//   seed=seed^(seed>>15);
+// }
+uint pcg_hash(inout uint state)
 {
-  seed=(seed^61)^(seed>>16);
-  seed=seed*9;
-  seed=seed^(seed>>4);
-  seed=seed*0x27d4eb2d;
-  seed=seed^(seed>>15);
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+uint generate_seed(uint2 pixel, uint frame)
+{
+    return (pixel.x * 1973u + pixel.y * 9277u + frame * 26699u) ^ 0x6f5ca34du;
 }
 
 float random(inout uint seed)
 {
-  wanghash(seed);
-  return float(seed)/4294967296.0;
+  return (float)pcg_hash(seed) / 4294967296.0;
 }
 
 float f3_max(float3 u){
@@ -85,18 +103,17 @@ void SampleBSDF(Material material, float3 ray, float3 normal, out float3 wi, out
 }
 
 [shader("raygeneration")] void RayGenMain() {
+  
+  uint2 pixel_coords = DispatchRaysIndex().xy;
+  int seed = generate_seed(pixel_coords, render_setting.frame_count);
 
-  float2 pixel_center = (float2)DispatchRaysIndex() + float2(0.5,0.5); //float2(random(), random());
+  float2 pixel_center = (float2)DispatchRaysIndex() + float2(0.5, 0.5); //float2(random(), random());
   float2 uv = pixel_center / float2(DispatchRaysDimensions().xy);
   uv.y = 1.0 - uv.y; 
   float2 d = uv * 2.0 - 1.0;
   float4 origin = mul(camera_info.camera_to_world, float4(0, 0, 0, 1));
   float4 target = mul(camera_info.screen_to_camera, float4(d, 1, 1));
   float4 direction = mul(camera_info.camera_to_world, float4(target.xyz, 0));
-
-  uint2 pixel_coords = DispatchRaysIndex().xy;
-
-  int seed = pixel_coords[0] * pixel_coords[1];
 
   float3 color = float3(0.0, 0.0, 0.0);
   float3 throughout = float3(1.0, 1.0, 1.0);

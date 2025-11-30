@@ -9,6 +9,13 @@ struct CameraObject {
     glm::mat4 camera_to_world;
 };
 
+struct RenderSettings {  // Mainly for random seed
+    uint32_t frame_count;
+    uint32_t samples_per_pixel;
+    uint32_t max_depth;
+    uint32_t enable_accumulation;
+};
+
 class Application {
 public:
     Application(grassland::graphics::BackendAPI api = grassland::graphics::BACKEND_API_DEFAULT);
@@ -90,4 +97,8 @@ private:
     
     // Entity selection
     int selected_entity_id_; // -1 if no entity selected
+
+    uint32_t frame_count_;
+    uint32_t samples_per_pixel_;
+    std::unique_ptr<grassland::graphics::Buffer> render_settings_buffer_;
 };
