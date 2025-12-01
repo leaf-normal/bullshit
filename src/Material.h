@@ -17,4 +17,3 @@ struct Material {
         , roughness(rough)
         , metallic(metal) {}
 };
-
