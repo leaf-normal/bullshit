@@ -19,11 +19,7 @@ namespace {
 
 Application::Application(grassland::graphics::BackendAPI api) 
     : frame_count_(0)
-<<<<<<< HEAD
     , samples_per_pixel_(1) {
-=======
-    , samples_per_pixel_(1) { // *add
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
 
     grassland::graphics::CreateCore(api, grassland::graphics::Core::Settings{}, &core_);
     core_->InitializeLogicalDeviceAutoSelect(true);
@@ -196,7 +192,6 @@ void Application::OnInit() {
     mouse_x_ = 0.0;
     mouse_y_ = 0.0;
 
-<<<<<<< HEAD
     // 初始化光源管理器
     light_manager_ = std::make_unique<LightManager>();
     light_manager_->Initialize(core_.get());
@@ -205,9 +200,6 @@ void Application::OnInit() {
     light_manager_->CreateDefaultLights();
     
     // 初始化渲染设置
-=======
-    // *add, initial render settings
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
     core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
     
     RenderSettings initial_settings{};
@@ -217,11 +209,7 @@ void Application::OnInit() {
     initial_settings.enable_accumulation = 1;
     render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
 
-<<<<<<< HEAD
     // 创建场景
-=======
-    // Create scene
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
     scene_ = std::make_unique<Scene>(core_.get());
 
     // 添加实体
@@ -331,16 +319,11 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space6 - accumulated color
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space7 - accumulated samples
 
-<<<<<<< HEAD
     // 几何信息
-=======
-    // *add geometry
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - geometry descriptors
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space9 - vertex infos 
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space10 - indices    
 
-<<<<<<< HEAD
     // 渲染设置
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space 11 - render setting
     
@@ -348,11 +331,6 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space 12 - lights buffer
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space 13 - light count
     
-=======
-    // *add render setting
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space 11 - render setting
-    //program_->Finalize();
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
     try {
         program_->Finalize();
         grassland::LogInfo("Ray tracing program finalized successfully");
@@ -448,10 +426,6 @@ void Application::OnUpdate() {
         
         render_settings_buffer_->UploadData(&settings, sizeof(RenderSettings));
 
-<<<<<<< HEAD
-=======
-        // Detect camera state change and reset accumulation if camera started moving
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
         if (camera_enabled_ != last_camera_enabled_) {
             if (camera_enabled_) {
                 grassland::LogInfo("Camera enabled - accumulation will reset when camera stops");
@@ -745,11 +719,7 @@ void Application::RenderEntityPanel() {
         }
         
         if (entity->GetVertexInfoBuffer()) {
-<<<<<<< HEAD
             size_t vertex_size = sizeof(float) * 3;
-=======
-            size_t vertex_size = sizeof(float) * 3; // Assuming pos(3)
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
             size_t vertex_count = entity->GetVertexInfoBuffer()->Size() / vertex_size;
             ImGui::Text("Vertices: %zu", vertex_count);
         }
@@ -877,16 +847,11 @@ void Application::OnRender() {
     command_context->CmdBindResources(6, { film_->GetAccumulatedColorImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(7, { film_->GetAccumulatedSamplesImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
-<<<<<<< HEAD
     // Geometry data
-=======
-    // *add
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
     command_context->CmdBindResources(8, { scene_->GetGeometryDescriptorsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(9, { scene_->GetVertexInfoBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(10, { scene_->GetIndexBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
 
-<<<<<<< HEAD
     // Render settings
     command_context->CmdBindResources(11, { render_settings_buffer_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
@@ -894,11 +859,6 @@ void Application::OnRender() {
     command_context->CmdBindResources(12, { light_manager_->GetLightsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(13, { light_manager_->GetLightCountBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
-=======
-    // *add
-    command_context->CmdBindResources(11, { render_settings_buffer_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    
->>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
     command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
     
     grassland::graphics::Image* display_image = color_image_.get();
