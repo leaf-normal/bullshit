@@ -101,6 +101,10 @@ private:
     uint32_t frame_count_;
     uint32_t samples_per_pixel_;
     std::unique_ptr<grassland::graphics::Buffer> render_settings_buffer_;
+<<<<<<< HEAD
     
     std::unique_ptr<LightManager> light_manager_;
 };
+=======
+};
+>>>>>>> 8377127856340f91bc6b667e1f99af605ec09f1a
