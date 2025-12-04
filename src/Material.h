@@ -7,7 +7,7 @@ struct Material {
     float metallic;
     unsigned int light_index;
 
-    float3 emission;        // 自发光颜色
+    glm::vec3 emission;        // 自发光颜色
     float ior;              // 折射率
     float transparency;     // 透明度
     int texture_id;       
@@ -27,7 +27,7 @@ struct Material {
         roughness(0.5f), 
         metallic(0.0f), 
         light_index(0xFFFFFFFF),
-        emission(float3(0.0f, 0.0f, 0.0f)),
+        emission(glm::vec3(0.0f, 0.0f, 0.0f)),
         ior(1.0f),
         transparency(0.0f),
         texture_id(-1),  // -1 表示没有纹理
@@ -43,7 +43,7 @@ struct Material {
     
     
     Material(const glm::vec3& color, float rough = 0.5f, float metal = 0.0f, 
-             unsigned int index = 0xFFFFFFFF, const float3& emit = float3(0.0f, 0.0f, 0.0f),
+             unsigned int index = 0xFFFFFFFF, const glm::vec3& emit = glm::vec3(0.0f, 0.0f, 0.0f),
              float refractive_index = 1.0f, float trans = 0.0f, int tex_id = -1,
              float sub = 0.0f, float spec = 0.5f, float spec_tint = 0.0f,
              float aniso = 0.0f, float sh = 0.0f, float sh_tint = 0.0f,
