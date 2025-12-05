@@ -71,7 +71,7 @@ struct Light {
     float3 position;       // 光源位置
     float3 direction;      // 方向向量：
                              // - 点光源：不使用（置0）
-                             // - 面光源：法线方向
+                             // - 面光源：法线方向（单向）
                              // - 聚光灯：光照方向
     float3 tangent;        // 面光源的切向量，保证正交归一化
     float3 color;          // 光源颜色
@@ -232,6 +232,7 @@ void sample_area_light(inout Light light, inout float3 hit_point, inout uint see
     // 检查可见性（面光源只有一面发光）
     float cos_theta_l = dot(-sample.direction, light.direction);
     if (cos_theta_l <= 0.0) {
+        sample.valid = 0;
         return; // 从背面看不到
     }
     
@@ -701,6 +702,56 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
     return total_light;
 }
 
+float IntersectRaySphere(inout RayDesc ray, inout float3 sphere_center, float sphere_radius) {
+    float3 oc = ray.Origin - sphere_center;
+    float a = dot(ray.Direction, ray.Direction);
+    float b = dot(oc, ray.Direction);
+    float c = dot(oc, oc) - sphere_radius * sphere_radius;
+    
+    float delta = b * b - a * c;  // divide 2
+    
+    if (delta < 0.0) {
+        return -1.0;
+    }
+
+    delta = sqrt(delta);
+    
+    float t = (-b - delta) / a;
+    
+    if (t < ray.TMin) {
+        t = (-b + delta) / a;
+    }
+
+    return (t >= ray.TMin && t <= ray.TMax) ? t : -1.0;
+    
+}
+
+void CheckHitSphereLight(inout uint light_count, inout RayDesc ray, inout RayPayload payload, inout uint closest_light_idx) {
+    float closest_distance = ray.TMax;
+    closest_light_idx = 0xFFFFFFFF;
+    
+    if (payload.hit) {
+        closest_distance = length(payload.hit_point - ray.Origin);//RayTCurrent();
+    }
+    
+    for (int i = 0; i < light_count; ++i) {
+        Light light = lights[i];
+        
+        if (light.type != 3 || !light.visible || !light.enabled) {
+            continue;
+        }
+        
+        float t = IntersectRaySphere(ray, light.position, light.radius);
+        
+        if (t > 0.0 && t < closest_distance) {
+            closest_distance = t;
+            closest_light_idx = i;
+            
+            payload.hit = true;
+            payload.hit_point = ray.Origin + t * ray.Direction;
+        }
+    }
+}
 
 // // ====================== 主渲染逻辑 ======================
 [shader("raygeneration")]
@@ -730,75 +781,86 @@ void RayGenMain() {
 
     entity_id_output[pixel_coords] = -1;
 
-    float3 prev_hit_point;
+    float3 prev_hit_point, prev_normal;
     float3 prev_eval_bsdf;
     float prev_bsdf_pdf;
     bool prev_is_specular = false;
 
-    uint light_count, stride_;
-    lights.GetDimensions(light_count, stride_);
+    uint light_count, light_idx;
+    lights.GetDimensions(light_count, light_idx);
 
     for (int depth = 0; depth < min(render_setting.max_depth, MAX_DEPTH); ++depth) {
         RayPayload payload;
         payload.hit = false;
         
         TraceRay(as, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
-        
-        if (!payload.hit) {
-            // 天空盒
-            color += payload.color * throughput;
-            break;
-        }
-        
-        // 记录首次命中的实体ID
-        if (depth == 0) {
-            entity_id_output[pixel_coords] = (int)payload.instance_id;
+
+        CheckHitSphereLight(light_count, ray, payload, light_idx);
+
+        Material mat;
+
+        if(light_idx == 0xFFFFFFFF){
+            if (!payload.hit) {
+                // 天空盒
+                color += payload.color * throughput;
+                break;
+            }
+            
+            // 记录首次命中的实体ID
+            if (depth == 0) {
+                entity_id_output[pixel_coords] = (int)payload.instance_id;
+            }
+
+            mat = materials[payload.instance_id];
+            light_idx = mat.light_index;
         }
 
-        Material mat = materials[payload.instance_id];
         float3 wo = -ray.Direction;
         
         // 处理光源命中
-        if (mat.light_index != 0xFFFFFFFF) {
-            if (depth == 0 || prev_is_specular) {
-                // 第一次直接击中光源或镜面反射击中光源
-                Light light = lights[mat.light_index];
-                if (light.enabled) {
-                    color += light.color * light.intensity * throughput;
-                }
-            } else {
-                // BSDF采样击中光源，需要MIS
-                Light light = lights[mat.light_index];
-                if (!light.enabled || (light.type != 1 && light.type != 3)) {
-                    break;
-                }
-                
-                float3 to_light = payload.hit_point - prev_hit_point;
-                float distance = length(to_light);
-                float3 light_dir = to_light / distance;
-                
-                // 计算光源采样PDF
-                float light_pdf = 0.0;
-                float cos_theta_l = max(0.0, dot(-light_dir, payload.normal));
-                
-                if (light.type == 1) { // 面光源
-                    float area = light.size.x * light.size.y;
-                    light_pdf = (distance * distance) / (cos_theta_l * area);
-                } else if (light.type == 3) { // 球光源
-                    float surface_area = 4.0 * PI * light.radius * light.radius;
-                    light_pdf = (distance * distance) / (cos_theta_l * surface_area);
-                }
-                
-                float light_select_pdf = light_power_weights[mat.light_index];
-                light_pdf *= light_select_pdf;
+        if (light_idx != 0xFFFFFFFF) {
+            Light light = lights[light_idx];
 
-                // 计算MIS权重
-                float mis_weight = mis_balance_weight(prev_bsdf_pdf, light_pdf);
-                
-                // 应用MIS
-                color += light.color * light.intensity * throughput * prev_eval_bsdf * mis_weight / prev_bsdf_pdf;
+            if(light.type != 1 || dot(wo, light.direction) > 0){
+
+                if (depth == 0 || prev_is_specular) {
+                    // 第一次直接击中光源或镜面反射击中光源
+                    if (light.enabled) {
+                        color += light.color * light.intensity * throughput;
+                    }
+                } else {
+                    // BSDF采样击中光源，需要MIS
+                    if (!light.enabled || (light.type != 1 && light.type != 3)) {
+                        break;
+                    }
+                    
+                    float3 to_light = payload.hit_point - prev_hit_point;
+                    float distance = length(to_light);
+                    float3 light_dir = to_light / distance;
+                    
+                    // 计算光源采样PDF
+                    float light_pdf = 0.0;
+                    float cos_theta_l = max(0.0, dot(-light_dir, prev_normal));
+                    
+                    if (light.type == 1) { // 面光源
+                        float area = light.size.x * light.size.y;
+                        light_pdf = (distance * distance) / (cos_theta_l * area);
+                    } else if (light.type == 3) { // 球光源
+                        float surface_area = 4.0 * PI * light.radius * light.radius;
+                        light_pdf = (distance * distance) / (cos_theta_l * surface_area);
+                    }
+                    
+                    float light_select_pdf = light_power_weights[light_idx];
+                    light_pdf *= light_select_pdf;
+
+                    // 计算MIS权重
+                    float mis_weight = mis_balance_weight(prev_bsdf_pdf, light_pdf);
+                    
+                    // 应用MIS
+                    color += light.color * light.intensity * throughput * prev_eval_bsdf * mis_weight / prev_bsdf_pdf;
+                }
+                break;
             }
-            break;
         }
 
         prev_hit_point = payload.hit_point;
@@ -845,6 +907,7 @@ void RayGenMain() {
         // 记录用于MIS的数据
         prev_bsdf_pdf = pdf;
         prev_eval_bsdf = bsdf_val * abs(cos_theta);
+        prev_normal = payload.normal;
         
         // 判断是否为镜面反射（简化：检查材质是否为金属或清漆）
         prev_is_specular = (mat.metallic > 0.5 || mat.clearcoat > 0.0);
@@ -872,7 +935,7 @@ void RayGenMain() {
 void MissMain(inout RayPayload payload) {
     // 简化的天空渐变
     float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);
-    payload.color = lerp(float3(1.0, 1.0, 1.0), float3(0.5, 0.7, 1.0), t) * 0.5;
+    payload.color = lerp(float3(1.0, 1.0, 1.0), float3(0.5, 0.7, 1.0), t) * 0.25;
     payload.hit = false;
     payload.instance_id = 0xFFFFFFFF;
 }
