@@ -1,6 +1,11 @@
 struct CameraInfo {
   float4x4 screen_to_camera;
   float4x4 camera_to_world;
+  float focal_distance;     // 焦点距离（世界空间）
+  float aperture_size;      // 光圈直径（控制模糊强度）
+  float focal_length;       // 焦距（控制视角）
+  float lens_radius;        // 透镜半径 = aperture_size/2
+  int enable_depth_of_field;
 };
 
 struct Material {
@@ -96,18 +101,15 @@ struct RayPayload {
 };
 
 // ====================== 常量定义 ======================
-#define MAX_DEPTH 16
+#define MAX_DEPTH 8
 #define RR_THRESHOLD 0.95f
 #define t_min 0.001
 #define t_max 10000.0
-#define eps 5e-4
+#define eps 5e-4 // used for geometry
+#define EPS 1e-6 // used for division
 #define PI 3.14159265359
 #define TWO_PI 6.28318530718
-#define DECAY 0.2 // 光衰减系数，越大衰减越快
-
-#define PHYSICAL_ATTENUATION 1  // 启用物理正确的衰减
 #define INV_PI 0.31830988618
-#define DECAY 0.2
 
 // ====================== 随机数生成 ======================
 uint pcg_hash(inout uint state) {
@@ -122,21 +124,6 @@ float random(inout uint seed) {
 
 float2 random2(inout uint seed) {
     return float2(random(seed), random(seed));
-}
-
-// ====================== 几何辅助函数 ======================
-float3 cosine_sample_hemisphere(inout uint seed, float3 normal) {
-    float2 u = random2(seed);
-    float phi = TWO_PI * u.x;
-    float z = u.y;
-    float r = sqrt(1.0 - z * z);
-    
-    float3 local_dir = float3(r * cos(phi), r * sin(phi), z);
-    
-    float3 tangent = normalize(cross(abs(normal.x) > 0.1 ? float3(0, 1, 0) : float3(1, 0, 0), normal));
-    float3 bitangent = cross(normal, tangent);
-    
-    return local_dir.x * tangent + local_dir.y * bitangent + local_dir.z * normal;
 }
 
 uint generate_seed(uint2 pixel, uint frame) {
@@ -359,6 +346,10 @@ float SchlickWeight(float cosTheta)
 {
   return pow( clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
+float SchlickFresnelScalar(float F0, float cosTheta)
+{
+  return F0 + (1.0 - F0) * SchlickWeight(cosTheta);
+}
 float3 SchlickFresnel(float3 F0, float cosTheta)
 {
   return F0 + (1.0 - F0) * SchlickWeight(cosTheta);
@@ -368,27 +359,27 @@ float GTR1(float NdotH, float a)
   if(a >= 1.0) return INV_PI;
   float a2 = sqr(a);
   float t = 1.0 + (a2 - 1.0) * sqr(NdotH);
-  return (a2 - 1.0) / (PI * log(a2) * t);
+  return (a2 - 1.0) / (PI * log(a2 + EPS) * t + EPS);
 }
 float GTR2(float NdotH, float a)
 {
     float a2 = sqr(a);
     float t = 1.0 + (a2 - 1.0) * sqr(NdotH);
-    return a2 / (PI * sqr(t));
+    return a2 / (PI * sqr(t) + EPS);
 }
 float GTR2_Anisotropic(float NdotH, float HdotX, float HdotY, float ax, float ay)
 {
-    return 1.0 / (PI * ax * ay * sqr(sqr(HdotX / ax) + sqr(HdotY / ay) + NdotH * NdotH));
+    return 1.0 / (PI * ax * ay * sqr(sqr(HdotX / ax) + sqr(HdotY / ay) + NdotH * NdotH) + EPS);
 }
 
 float SmithG_GGX(float NdotV, float alphaG) {
     float a=sqr(alphaG);
     float b=sqr(NdotV);
-    return 2.0*NdotV/(NdotV+sqrt(a+(1.0-a)*b));
+    return 2.0*NdotV/(NdotV+sqrt(a+(1.0-a)*b) + EPS);
 }
 float SmithG_GGX_Anisotropic(float NdotV, float VdotX, float VdotY, float ax, float ay)
 {
-    return 1.0/(NdotV+sqrt(sqr(VdotX*ax)+sqr(VdotY*ay)+sqr(NdotV)));
+    return 2.0*NdotV/(NdotV+sqrt(sqr(VdotX*ax)+sqr(VdotY*ay)+sqr(NdotV)) + EPS);
 }
 float3 SampleHemisphereCos(float2 randd, inout float3 normal)
 {
@@ -456,10 +447,10 @@ void GetTangent(inout float3 normal, out float3 tangent, out float3 bitangent)
 void SampleBSDF(inout Material mat, inout float3 ray, inout float3 normal, out float3 wi, inout uint seed){
 
   float3 F0=lerp(0.08*mat.specular,mat.base_color,mat.metallic);
-  float F0_scalar=dot(F0,float3(0.299,0.587,0.114));
   //lobe权重
   float diffuseweight=(1.0-mat.metallic)*(1.0-mat.transparency);//漫反射
-  float specularweight=SchlickFresnel(F0_scalar,dot(ray,normal))*(1.0-mat.transparency);
+  float F0_scalar = dot(F0, float3(0.299, 0.587, 0.114));
+  float specularweight=SchlickFresnelScalar(F0_scalar,dot(ray,normal))*(1.0-mat.transparency);
   // float transmissionweight=mat.transparency*mat.specular_transmission;//透射
   // float clearcoatweight=0.25*mat.clearcoat;//清漆层
   // float sheenweight=mat.sheen*(1.0-mat.metallic);//光泽层
@@ -476,23 +467,23 @@ void SampleBSDF(inout Material mat, inout float3 ray, inout float3 normal, out f
   GetTangent(normal, tangent, H);  
   if(randLobe<diffuseweight)//漫反射+简化光泽层模型
   {
-    wi=SampleHemisphereCos(float2(random(seed),random(seed)),normal);
+    wi=SampleHemisphereCos(random2(seed),normal);
   }else//镜面反射
   {
     if(abs(mat.anisotropic)>0.001)
-      H=SampleGGX_Anisotropic(ray,mat.roughness,mat.anisotropic,float2(random(seed),random(seed)),normal,tangent);
+      H=SampleGGX_Anisotropic(ray,mat.roughness,mat.anisotropic,random2(seed),normal,tangent);
     else
-      H=SampleGGX_VNDF(ray,mat.roughness,float2(random(seed),random(seed)),normal);
+      H=SampleGGX_VNDF(ray,mat.roughness,random2(seed),normal);
     wi=reflect(-ray,H);
   }
   // else if(randLobe<diffuseweight+sheenweight+specularweight+transmissionweight)//透射
   // {
   //   float eta=dot(ray,normal)>0.0?1.0/mat.ior:mat.ior;
-  //   H=SampleGGX_VNDF(ray,mat.roughness,float2(random(seed),random(seed)),normal);
+  //   H=SampleGGX_VNDF(ray,mat.roughness,random2(seed),normal);
   //   wi=refract(-ray,H,eta);
   //   if(length(wi)<eps)wi=reflect(-ray,H);//全反射
   // }else{//清漆
-  //   H=SampleGGX_VNDF(ray,mat.clearcoat_roughness,float2(random(seed),random(seed)),normal);
+  //   H=SampleGGX_VNDF(ray,mat.clearcoat_roughness,random2(seed),normal);
   //   wi=reflect(-ray,H);
   // }
   if(dot(normal,wi)<0.0&&mat.transparency<eps)wi=reflect(wi,normal);
@@ -557,11 +548,11 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
     diffusePDF=max(Ndotwi,0.0)/PI;
     //镜面反射
     float D,G;
-    if(abs(mat.anisotropic)>eps)//各向异性镜面
-    {
-      float aspect=sqrt(1.0-0.9*mat.anisotropic);
-      float ax=max(eps,alpha/aspect);
-      float ay=max(eps,alpha*aspect);
+    // if(abs(mat.anisotropic)>eps)//各向异性镜面
+    // {
+      float aspect=max(EPS, sqrt(1.0-0.9*mat.anisotropic));
+      float ax=max(EPS,alpha/aspect);
+      float ay=max(EPS,alpha*aspect);
       float HdotX=dot(H,tangent);
       float HdotY=dot(H,bitangent);
       D=GTR2_Anisotropic(NdotH,HdotX,HdotY,ax,ay);
@@ -570,13 +561,14 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
       float LdotX=dot(wi,tangent);
       float LdotY=dot(wi,bitangent);
       G=SmithG_GGX_Anisotropic(Ndotray,VdotX,VdotY,ax,ay)*SmithG_GGX_Anisotropic(Ndotwi,LdotX,LdotY,ax,ay);
-    }else{//各向同性
-      D=GTR2(NdotH,alpha);
-      G=SmithG_GGX(Ndotray,mat.roughness)*SmithG_GGX(Ndotwi,mat.roughness);
-    }
-    specularPDF=D*NdotH/(4.0*Hdotray);
-    float3 spec=(D*G*F)/(4.0*Ndotray*Ndotwi);
-    if(mat.specular_tint>0.0)
+      specularPDF=GTR2_Anisotropic(NdotH,dot(H,tangent),dot(H,bitangent),ax,ay)*NdotH/(4.0*Hdotray+EPS);
+    // }else{//各向同性
+    //   D=GTR2(NdotH,alpha);
+    //   G=SmithG_GGX(Ndotray,mat.roughness)*SmithG_GGX(Ndotwi,mat.roughness);
+    //   specularPDF=D*NdotH/(4.0*Hdotray+EPS);
+    // }
+    float3 spec=(D*G*F)/(4.0*Ndotray*Ndotwi+EPS);
+    if(mat.specular_tint>EPS)
     {
       float3 tint=lerp(float3(1.0,1.0,1.0),mat.base_color,mat.specular_tint);
       spec*=tint;
@@ -606,11 +598,10 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
   // }
   //lobe权重
   //lobe权重
-  float F0_scalar = dot(F0, float3(0.299, 0.587, 0.114));
   float diffuseweight=(1.0-mat.metallic)*(1.0-mat.transparency);//漫反射
-  float specularweight=SchlickFresnel(F0_scalar,dot(ray,normal))*(1.0-mat.transparency);
-  //float transmissionweight=mat.transparency*mat.specular_transmission;//透射
-  //float clearcoatweight=0.25*mat.clearcoat;//清漆层  
+  float F0_scalar = dot(F0, float3(0.299, 0.587, 0.114));
+  float specularweight=SchlickFresnelScalar(F0_scalar,dot(ray,normal))*(1.0-mat.transparency);  //float transmissionweight=mat.transparency*mat.specular_transmission;//透射
+  //float clearcoatweight=mat.clearcoat;//清漆层  
   //float sheenweight=mat.sheen*(1.0-mat.metallic);//光泽层
   // //normalization
   float total=diffuseweight+specularweight;//+transmissionweight+clearcoatweight+sheenweight;
@@ -620,6 +611,7 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
   //clearcoatweight/=total;
   //sheenweight/=total;
   pdf=diffusePDF*diffuseweight+specularPDF*specularweight;//+transmissionweight*transmissionPDF+clearcoatweight*clearcoatPDF+sheenPDF*sheenweight;
+  // ret = max(ret, float3(0.0, 0.0, 0.0));
   return ret;
 }
 
@@ -648,10 +640,11 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
                            inout float3 wo, inout uint seed) {
     float3 total_light = float3(0, 0, 0);
 
-    if (!is_enable_lights(light_count) || mat.metallic > 0.5) return total_light;
+    if (!is_enable_lights(light_count) || mat.metallic > 0.8) return total_light;
 
-    
-    for (int i = 0; i < light_count && i < 4; ++i) {
+    uint sample_times = min(4, light_count);
+
+    for (int i = 0; i < sample_times; ++i) {
         // 按功率重要性采样光源
         int light_idx = sample_light_by_power(light_count, seed);
         if (light_idx < 0) continue;
@@ -666,7 +659,6 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
             case 3: sample_sphere_light(light, hit_point, seed, light_sample); break;
         }
 
-        
         if (!light_sample.valid){
           continue;
         }
@@ -679,9 +671,12 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
         
         // 计算 BRDF 贡献
         float3 wi = light_sample.direction;
+        float ndotl = max(0.0, dot(normal, wi));
         float pdf;
         float3 bsdf_val = EvalBSDF(mat, wo, wi, normal, pdf);
-        float ndotl = max(0.0, dot(normal, wi));
+        // bsdf_val = max( min(bsdf_val, 50.0 * float3(1 / (ndotl + EPS), 1 / (ndotl + EPS), 1 / (ndotl + EPS))), float3(0.0, 0.0, 0.0));
+        // pdf = max(pdf, 0.0);
+
         float3 light_contrib = light_sample.radiance * bsdf_val * ndotl;
         
         if (any(light_contrib > 0.0)) {
@@ -700,7 +695,7 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
             }
         }
     }
-    return total_light;
+    return total_light / sample_times;
 }
 
 float IntersectRaySphere(inout RayDesc ray, inout float3 sphere_center, float sphere_radius) {
@@ -716,7 +711,6 @@ float IntersectRaySphere(inout RayDesc ray, inout float3 sphere_center, float sp
     }
 
     delta = sqrt(delta);
-    
     float t = (-b - delta) / a;
     
     if (t < ray.TMin) {
@@ -753,25 +747,94 @@ void CheckHitSphereLight(inout uint light_count, inout RayDesc ray, inout RayPay
         }
     }
 }
+// ====================== 景深辅助函数 ====================
 
-// // ====================== 主渲染逻辑 ======================
+float2 concentric_sample_disk(inout uint seed) {
+    float2 u = random2(seed) * 2.0 - 1.0;
+    
+    if (u.x == 0.0 && u.y == 0.0) {
+        return float2(0.0, 0.0);
+    }
+    
+    float theta, r;
+    if (abs(u.x) > abs(u.y)) {
+        r = u.x;
+        theta = (PI / 4.0) * (u.y / u.x);
+    } else {
+        r = u.y;
+        theta = (PI / 2.0) - (PI / 4.0) * (u.x / u.y);
+    }
+    
+    return r * float2(cos(theta), sin(theta));
+}
+
+float3 compute_focal_point(float3 ray_origin, float3 ray_dir, float focal_distance) {
+    // 计算光线与焦平面的交点
+    // 假设焦平面垂直于相机前向方向
+    float3 camera_forward = float3(0.0, 0.0, -1.0); // 相机空间前向
+    float3 world_forward = mul((float3x3)camera_info.camera_to_world, camera_forward);
+    world_forward = normalize(world_forward);
+    
+    // 焦平面方程: dot(p - (origin + world_forward * focal_distance), world_forward) = 0
+    float3 focal_plane_origin = ray_origin + world_forward * focal_distance;
+    float denom = dot(ray_dir, world_forward);
+    
+    if (abs(denom) > 1e-6) {
+        float t = dot(focal_plane_origin - ray_origin, world_forward) / denom;
+        return ray_origin + ray_dir * t;
+    }
+    
+    // 平行于焦平面，使用近似值
+    return ray_origin + ray_dir * focal_distance;
+}
+
+// ====================== 主渲染逻辑 ======================
 [shader("raygeneration")]
 void RayGenMain() {
+    // uint2 pixel_coords = DispatchRaysIndex().xy;
+    // uint seed = generate_seed(pixel_coords, render_setting.frame_count);
+
+    // // 生成相机射线
+    // float2 pixel_center = (float2)DispatchRaysIndex() + 
+    //                      (render_setting.enable_accumulation ? random2(seed) : float2(0.5, 0.5));
+    // float2 uv = pixel_center / float2(DispatchRaysDimensions().xy);
+    // uv.y = 1.0 - uv.y;
+    
+    // float2 d = uv * 2.0 - 1.0;
+    // float4 origin = mul(camera_info.camera_to_world, float4(0, 0, 0, 1));
+    // float4 target = mul(camera_info.screen_to_camera, float4(d, 1, 1));
+    // float4 direction = mul(camera_info.camera_to_world, float4(target.xyz, 0));
     uint2 pixel_coords = DispatchRaysIndex().xy;
     uint seed = generate_seed(pixel_coords, render_setting.frame_count);
 
-    // 生成相机射线
+    // 生成相机射线（相机空间）
     float2 pixel_center = (float2)DispatchRaysIndex() + 
                          (render_setting.enable_accumulation ? random2(seed) : float2(0.5, 0.5));
     float2 uv = pixel_center / float2(DispatchRaysDimensions().xy);
     uv.y = 1.0 - uv.y;
     
     float2 d = uv * 2.0 - 1.0;
-    float4 origin = mul(camera_info.camera_to_world, float4(0, 0, 0, 1));
-    float4 target = mul(camera_info.screen_to_camera, float4(d, 1, 1));
-    float4 direction = mul(camera_info.camera_to_world, float4(target.xyz, 0));
+    
+    float4 target_camera = mul(camera_info.screen_to_camera, float4(d, 1, 1));
+    float3 ray_dir_camera = normalize(target_camera.xyz);
+    
+    float3 ray_origin_camera = float3(0, 0, 0); 
+    
+    // 景深效果：薄透镜相机模型
+    if (camera_info.enable_depth_of_field && camera_info.lens_radius > 0.0) {
+        
+        float3 focal_point_camera = ray_dir_camera * (camera_info.focal_distance / max(-ray_dir_camera.z, EPS));;
 
-    // 路径追踪
+        float2 lens_sample = concentric_sample_disk(seed) * camera_info.lens_radius;
+        
+        ray_origin_camera = float3(lens_sample.x, lens_sample.y, 0.0f);
+        
+        ray_dir_camera = normalize(focal_point_camera - ray_origin_camera);
+    }
+    
+    float4 origin = mul(camera_info.camera_to_world, float4(ray_origin_camera, 1.0));
+    float4 direction = mul(camera_info.camera_to_world, float4(ray_dir_camera, 0.0));
+    
     float3 color = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
     RayDesc ray;
@@ -783,7 +846,6 @@ void RayGenMain() {
     entity_id_output[pixel_coords] = -1;
 
     float3 prev_hit_point, prev_normal;
-    float3 prev_eval_bsdf;
     float prev_bsdf_pdf;
     bool prev_is_specular = false;
 
@@ -841,7 +903,7 @@ void RayGenMain() {
                     
                     // 计算光源采样PDF
                     float light_pdf = 0.0;
-                    float cos_theta_l = max(0.0, dot(-light_dir, prev_normal));
+                    float cos_theta_l = max(0.0, dot(light_dir, prev_normal));
                     
                     if (light.type == 1) { // 面光源
                         float area = light.size.x * light.size.y;
@@ -858,7 +920,7 @@ void RayGenMain() {
                     float mis_weight = mis_balance_weight(prev_bsdf_pdf, light_pdf);
                     
                     // 应用MIS
-                    color += light.color * light.intensity * throughput * prev_eval_bsdf * mis_weight / prev_bsdf_pdf;
+                    color += light.color * light.intensity * throughput * mis_weight; // Here throughut equals to pre_throughput * prev_eval_brdf / prev_bsdf_pdf
                 }
                 break;
             }
@@ -883,13 +945,19 @@ void RayGenMain() {
         }
         
         // 采样下一跳方向（BSDF采样）
-        float3 wi;
+        float3 wi = float3(0.0, 0.0, 0.0);
         SampleBSDF(mat, wo, payload.normal, wi, seed);
+        //wi = SampleHemisphereCos(random2(seed),payload.normal);
+
         float pdf;
         float3 bsdf_val = EvalBSDF(mat, wo, wi, payload.normal, pdf);
-        
-        if (pdf <= 0.0) {
+
+        if (pdf <= EPS) {
             break;
+        }
+        if(isinf(pdf) || isnan(pdf)){
+          color = float3(1e9, 0.0, isnan(pdf)? 1e9: 0);
+          break;
         }
         
         // 计算余弦项
@@ -900,18 +968,19 @@ void RayGenMain() {
             float Ndotwi = dot(payload.normal, wi);
             bool is_trans = Ndotray * Ndotwi < 0.0;
             if (!is_trans) break; // 非透射且余弦为负，终止
+            payload.normal = - payload.normal;
         }
         
         // 更新吞吐量
-        throughput *= bsdf_val * abs(cos_theta) / pdf;
+        throughput *= bsdf_val * cos_theta / pdf;
+        // throughput = max(throughput, float3(0.0, 0.0, 0.0));
+
         
         // 记录用于MIS的数据
         prev_bsdf_pdf = pdf;
-        prev_eval_bsdf = bsdf_val * abs(cos_theta);
         prev_normal = payload.normal;
         
-        // 判断是否为镜面反射（简化：检查材质是否为金属或清漆）
-        prev_is_specular = (mat.metallic > 0.5 || mat.clearcoat > 0.0);
+        prev_is_specular = (mat.metallic > 0.8 || mat.clearcoat > 0.0); // simplified
         
         // 准备下一次光线
         ray.Origin = payload.hit_point + payload.normal * eps;
@@ -919,6 +988,8 @@ void RayGenMain() {
         ray.TMin = t_min;
         ray.TMax = t_max;
     }
+
+    // color = max(color, float3(0.0, 0.0, 0.0));
     
     // 输出和累积
     output[pixel_coords] = float4(color, 1);
