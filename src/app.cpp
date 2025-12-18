@@ -1,6 +1,7 @@
 #include "app.h"
 #include "Material.h"
 #include "Entity.h"
+#include "Light.h"
 #include "TextureManager.h"
 // #include "TextureManager.cpp"
 
@@ -337,7 +338,7 @@ void Application::ApplyMotionBlurParams() {
 
 void Application::OnInit() {
     alive_ = true;
-    core_->CreateWindowObject(1920, 1080,
+    core_->CreateWindowObject(2560, 1440,
         ((core_->API() == grassland::graphics::BACKEND_API_VULKAN) ? "[Vulkan]" : "[D3D12]") +
         std::string(" Ray Tracing Scene Demo"),
         &window_);
@@ -369,25 +370,17 @@ void Application::OnInit() {
     mouse_x_ = 0.0;
     mouse_y_ = 0.0;
     
-
     // 创建场景
     scene_ = std::make_unique<Scene>(core_.get());
 
-        // 初始化光源管理器
-    light_manager_ = std::make_unique<LightManager>();
-    light_manager_->Initialize(core_.get(), scene_.get());
-    
-    // 添加默认光源
-    light_manager_->CreateDefaultLights();
-
 
     //初始化TextureManager
-    texture_manager_=std::make_unique<TextureManager>(core_.get());
+    texture_manager_ = std::make_unique<TextureManager>(core_.get());
     //测试纹理
-    int checkerTexId=texture_manager_->LoadTexture("textures/1.png");
+    int checkerTexId = texture_manager_->LoadTexture("textures/1.png");
     //HDR
     try {
-        skybox_texture_id_ = texture_manager_->LoadHDRTexture("textures/skybox.hdr");
+        skybox_texture_id_ = texture_manager_->LoadHDRTexture("textures/skybox.hdr", MUL_INTENS_SKYBOX);
         enable_skybox_ = true;
         // skybox_intensity_ = 1.0f;
         // skybox_rotation_ = 0.0f;
@@ -407,6 +400,15 @@ void Application::OnInit() {
     core_->CreateSampler(sampler_desc, &sampler_);
 
 
+    // 初始化光源管理器
+    light_manager_ = std::make_unique<LightManager>();
+    light_manager_->Initialize(core_.get(), scene_.get());
+    light_manager_->SetHDRPower( texture_manager_->GetHDRTotalLuminance(skybox_texture_id_) );
+    
+    // 添加默认光源
+    light_manager_->CreateDefaultLights();
+
+
     // 初始化渲染设置
     core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
     
@@ -415,6 +417,7 @@ void Application::OnInit() {
     initial_settings.samples_per_pixel = samples_per_pixel_;
     initial_settings.max_depth = 8;
     initial_settings.enable_accumulation = 1;
+    initial_settings.light_count = light_manager_->GetLightCount();
     initial_settings.skybox_texture_id_ = skybox_texture_id_;
     render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
 
@@ -566,6 +569,7 @@ void Application::OnInit() {
     //Texture
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_IMAGE, 128);                 // space18 - textures
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_SAMPLER, 1);                 // space19 - sampler
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space20 - hdr_cdf_buffer
     try {
         program_->Finalize();
         grassland::LogInfo("Ray tracing program finalized successfully");
@@ -599,44 +603,44 @@ void Application::OnClose() {
 void Application::UpdateHoveredEntity() {
     hovered_entity_id_ = -1;
     hovered_pixel_color_ = glm::vec4(0.0f);
-    //if (camera_enabled_) {
-    //    hovered_entity_id_ = -1;
-    //    hovered_pixel_color_ = glm::vec4(0.0f);
-    //    return;
-    //}
+    if (camera_enabled_) {
+       hovered_entity_id_ = -1;
+       hovered_pixel_color_ = glm::vec4(0.0f);
+       return;
+    }
 
-    //int x = static_cast<int>(mouse_x_);
-    //int y = static_cast<int>(mouse_y_);
-    //int width = window_->GetWidth();
-    //int height = window_->GetHeight();
-    //
-    //if (x < 0 || x >= width || y < 0 || y >= height) {
-    //    hovered_entity_id_ = -1;
-    //    hovered_pixel_color_ = glm::vec4(0.0f);
-    //    return;
-    //}
+    int x = static_cast<int>(mouse_x_);
+    int y = static_cast<int>(mouse_y_);
+    int width = window_->GetWidth();
+    int height = window_->GetHeight();
+    
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+       hovered_entity_id_ = -1;
+       hovered_pixel_color_ = glm::vec4(0.0f);
+       return;
+    }
 
-    //grassland::graphics::Offset2D offset{ x, y };
-    //grassland::graphics::Extent2D extent{ 1, 1 };
-    //
-    //int32_t entity_id = -1;
-    //entity_id_image_->DownloadData(&entity_id, offset, extent);
-    //hovered_entity_id_ = entity_id;
-    //
-    //float accumulated_rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    //film_->GetAccumulatedColorImage()->DownloadData(accumulated_rgba, offset, extent);
-    //
-    //int sample_count = film_->GetSampleCount();
-    //if (sample_count > 0) {
-    //    hovered_pixel_color_ = glm::vec4(
-    //        accumulated_rgba[0] / static_cast<float>(sample_count),
-    //        accumulated_rgba[1] / static_cast<float>(sample_count),
-    //        accumulated_rgba[2] / static_cast<float>(sample_count),
-    //        accumulated_rgba[3] / static_cast<float>(sample_count)
-    //    );
-    //} else {
-    //    hovered_pixel_color_ = glm::vec4(0.0f);
-    //}
+    grassland::graphics::Offset2D offset{ x, y };
+    grassland::graphics::Extent2D extent{ 1, 1 };
+    
+    int32_t entity_id = -1;
+    entity_id_image_->DownloadData(&entity_id, offset, extent);
+    hovered_entity_id_ = entity_id;
+    
+    float accumulated_rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    film_->GetAccumulatedColorImage()->DownloadData(accumulated_rgba, offset, extent);
+    
+    int sample_count = film_->GetSampleCount();
+    if (sample_count > 0) {
+       hovered_pixel_color_ = glm::vec4(
+           accumulated_rgba[0] / static_cast<float>(sample_count),
+           accumulated_rgba[1] / static_cast<float>(sample_count),
+           accumulated_rgba[2] / static_cast<float>(sample_count),
+           accumulated_rgba[3] / static_cast<float>(sample_count)
+       );
+    } else {
+       hovered_pixel_color_ = glm::vec4(0.0f);
+    }
 }
 
 void Application::OnUpdate() {
@@ -664,6 +668,7 @@ void Application::OnUpdate() {
         settings.samples_per_pixel = samples_per_pixel_;
         settings.max_depth = 8;
         settings.enable_accumulation = !camera_enabled_;
+        settings.light_count = light_manager_->GetLightCount();
         settings.skybox_texture_id_ = skybox_texture_id_;
         
         render_settings_buffer_->UploadData(&settings, sizeof(RenderSettings));
@@ -1359,6 +1364,8 @@ void Application::OnRender() {
         return;
     }
 
+    std::shared_ptr<grassland::graphics::Buffer> empty_buffer;
+
     std::unique_ptr<grassland::graphics::CommandContext> command_context;
     core_->CreateCommandContext(&command_context);
     command_context->CmdClearImage(color_image_.get(), { {0.6, 0.7, 0.8, 1.0} });
@@ -1409,6 +1416,8 @@ void Application::OnRender() {
     }
     command_context->CmdBindResources(18, texture_images, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(19, { sampler_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
+    grassland::graphics::Buffer* hdr_cdf_buffer = texture_manager_->GetHDRCDFBuffer(skybox_texture_id_);
+    command_context->CmdBindResources(20, { hdr_cdf_buffer ? hdr_cdf_buffer : empty_buffer.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
 
     command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
     

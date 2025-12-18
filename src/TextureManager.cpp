@@ -25,7 +25,7 @@ int TextureManager::LoadTexture(const std::string& filename) {
     return static_cast<int>(textures_.size() - 1); // 返回纹理ID
 }
 
-int TextureManager::LoadHDRTexture(const std::string& filename) {
+int TextureManager::LoadHDRTexture(const std::string& filename, float intensity = 1.0) {
     Texture tex{};
     
     // stbi_set_flip_vertically_on_load(true); // HDR纹理通常需要垂直翻转
@@ -42,9 +42,9 @@ int TextureManager::LoadHDRTexture(const std::string& filename) {
     if (tex.channels == 3) {
         // RGB -> RGBA
         for (size_t i = 0; i < pixel_count; ++i) {
-            tex.hdr_data[i*4 + 0] = img[i*3 + 0];
-            tex.hdr_data[i*4 + 1] = img[i*3 + 1];
-            tex.hdr_data[i*4 + 2] = img[i*3 + 2];
+            tex.hdr_data[i*4 + 0] = img[i*3 + 0] * intensity;
+            tex.hdr_data[i*4 + 1] = img[i*3 + 1] * intensity;
+            tex.hdr_data[i*4 + 2] = img[i*3 + 2] * intensity;
             tex.hdr_data[i*4 + 3] = 1.0f; 
         }
     } else if (tex.channels == 4) {
@@ -62,8 +62,160 @@ int TextureManager::LoadHDRTexture(const std::string& filename) {
     grassland::LogInfo("HDR Texture loaded: {} ({}x{}, {} channels)", 
                       filename, tex.width, tex.height, tex.channels);
     
+
+    ComputeHDRDistribution(tex);
+
     textures_.push_back(std::move(tex));
     return static_cast<int>(textures_.size() - 1);
+}
+
+float TextureManager::ComputeLuminance(const glm::vec3& rgb) const {
+    return glm::dot(rgb, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+}
+
+void TextureManager::ComputeHDRDistribution(Texture& texture) {
+    if (texture.width <= 0 || texture.height <= 0 || texture.hdr_data.empty()) {
+        return;
+    }
+    
+    grassland::LogInfo("Computing HDR distribution for {}x{} texture", 
+                      texture.width, texture.height);
+    
+    HDRDistributionData& distribution = texture.hdr_distribution;
+    int width = texture.width;
+    int height = texture.height;
+    
+    distribution.luminance_map.resize(width * height);
+    std::vector<float> row_sums(height, 0.0f);
+    
+    const float PI = 3.14159265359f;
+    float total_luminance = 0.0f;
+
+    for (int y = 0; y < height; ++y) {
+        float row_sum = 0.0f;
+        for (int x = 0; x < width; ++x) {
+            int idx = (y * width + x) * 4;
+            glm::vec3 color(
+                texture.hdr_data[idx],
+                texture.hdr_data[idx + 1],
+                texture.hdr_data[idx + 2]
+            );
+            
+            float theta = (static_cast<float>(y) + 0.5f) * PI / height;
+            float sin_theta = std::sin(theta);
+            
+            float luminance = ComputeLuminance(color) * sin_theta;
+            distribution.luminance_map[y * width + x] = luminance;
+            row_sum += luminance;
+        }
+        row_sums[y] = row_sum;
+        total_luminance += row_sum;
+    }
+    
+    distribution.total_luminance = total_luminance * (PI / height) * (2.0f * PI / width); // with area
+    
+    // 2. 计算条件CDF（每行）
+    distribution.conditional_cdf.resize(width * height);
+    for (int y = 0; y < height; ++y) {
+        float cumulative = 0.0f;
+        if (row_sums[y] > 0.0f) {
+            for (int x = 0; x < width; ++x) {
+                cumulative += distribution.luminance_map[y * width + x] / row_sums[y];
+                distribution.conditional_cdf[y * width + x] = cumulative;
+            }
+        } else {
+            // 如果行总和为0，使用均匀分布
+            for (int x = 0; x < width; ++x) {
+                distribution.conditional_cdf[y * width + x] = (x + 1.0f) / width;
+            }
+        }
+    }
+    
+    // 3. 计算边缘CDF（行方向）
+    distribution.marginal_cdf.resize(height);
+    float cumulative = 0.0f;
+    if (total_luminance > 0.0f) {
+        for (int y = 0; y < height; ++y) {
+            cumulative += row_sums[y] / total_luminance;
+            distribution.marginal_cdf[y] = cumulative;
+        }
+    } else {
+        // 如果总亮度为0，使用均匀分布
+        for (int y = 0; y < height; ++y) {
+            distribution.marginal_cdf[y] = (y + 1.0f) / height;
+        }
+    }
+    
+    // 验证CDF
+    if (!distribution.marginal_cdf.empty()) {
+        float max_cdf = distribution.marginal_cdf.back();
+        if (std::abs(max_cdf - 1.0f) > 1e-6f) {
+            grassland::LogWarning("HDR marginal CDF normalization error: {}", max_cdf);
+            // 重新归一化
+            for (float& val : distribution.marginal_cdf) {
+                val /= max_cdf;
+            }
+        }
+    }
+
+    size_t buffer_size = sizeof(float) * (3 + width * height + height); // [width, height, total_luminance] + conditional_cdf + marginal_cdf
+    std::vector<float> cdf_data;
+    cdf_data.reserve(3 + width * height + height);
+    
+    // 存储宽度和高度
+    cdf_data.push_back(static_cast<float>(width));
+    cdf_data.push_back(static_cast<float>(height));
+    cdf_data.push_back(distribution.total_luminance);
+    
+    // 存储条件CDF
+    cdf_data.insert(cdf_data.end(), 
+                   distribution.conditional_cdf.begin(), 
+                   distribution.conditional_cdf.end());
+    
+    // 存储边缘CDF
+    cdf_data.insert(cdf_data.end(),
+                   distribution.marginal_cdf.begin(),
+                   distribution.marginal_cdf.end());
+    
+    // 创建GPU缓冲区
+    core_->CreateBuffer(buffer_size, 
+                       grassland::graphics::BUFFER_TYPE_DYNAMIC,
+                       &distribution.cdf_buffer);
+    
+    distribution.cdf_buffer->UploadData(cdf_data.data(), buffer_size);
+    
+    texture.has_hdr_distribution = true;
+    
+    grassland::LogInfo("HDR distribution computed: total luminance = {:.3f}", 
+                      total_luminance);
+}
+
+void TextureManager::PreprocessHDRDistribution(int texture_id) {
+    if (texture_id < 0 || texture_id >= static_cast<int>(textures_.size())) {
+        throw std::runtime_error("Invalid texture ID for HDR preprocessing");
+    }
+    
+    Texture& texture = textures_[texture_id];
+    if (texture.hdr_data.empty()) {
+        throw std::runtime_error("Texture is not HDR");
+    }
+    
+    if (!texture.has_hdr_distribution) {
+        ComputeHDRDistribution(texture);
+    }
+}
+
+float TextureManager::GetHDRTotalLuminance(int texture_id) const {
+    if (texture_id < 0 || texture_id >= static_cast<int>(textures_.size())) {
+        return 0.0f;
+    }
+    
+    const Texture& texture = textures_[texture_id];
+    if (!texture.has_hdr_distribution) {
+        return 0.0f;
+    }
+    
+    return texture.hdr_distribution.total_luminance;
 }
 
 Texture* TextureManager::GetTexture(int id) {

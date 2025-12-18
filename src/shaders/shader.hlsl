@@ -74,6 +74,7 @@ struct RenderSettings {
     uint samples_per_pixel;
     uint max_depth;
     uint enable_accumulation;
+    uint light_count;
     int skybox_texture_id_;            // If not able, set to -1
 };
 
@@ -99,8 +100,8 @@ struct Light {
     uint visible;             // 光源是否可见
 };
 
-StructuredBuffer<Light> lights : register(t0, space12);
-StructuredBuffer<float> light_power_weights : register(t0, space13);
+StructuredBuffer<Light> lights : register(t0, space12);                // hdr is not included in lights
+StructuredBuffer<float> light_power_weights : register(t0, space13);   // Power weight of hdr will be added to last position
 
 // 物体运动
 
@@ -116,6 +117,9 @@ StructuredBuffer<MotionParams> motion_groups : register(t0, space14);
 // Texture
 Texture2D<float4> g_Textures[128] : register(t0, space18);
 SamplerState g_Sampler : register(s0, space19);
+
+// hdr_cdf
+StructuredBuffer<float> hdr_cdf : register(t0, space20);   // [width, height, total_luminance] + conditional_cdf + marginal_cdf
 
 
 struct RayPayload {
@@ -168,6 +172,9 @@ struct LightSample {
 };
 
 bool is_enable_lights(inout uint light_count){
+
+  if(render_setting.skybox_texture_id_ >= 0) return true;
+  
   for(int i = 0; i < light_count; ++i){
     if(light_power_weights[i] > 0.0){
       return true;
@@ -194,8 +201,7 @@ int sample_light_by_power(inout uint light_count, inout uint seed) {
 
     }
     
-    // 浮点误差保护
-    return last;
+    return render_setting.skybox_texture_id_ >= 0 ? light_count : last;
 }
 
 void sample_point_light(inout Light light, inout float3 hit_point, inout uint seed, out LightSample sample) {
@@ -320,7 +326,7 @@ void sample_spot_light(inout Light light, inout float3 hit_point, inout uint see
     sample.position = light.position;
     sample.direction = normalize(to_light);
     
-    // // 锥角检查
+    // 锥角检查
     float cos_angle = dot(-sample.direction, light.direction);
     float cos_cutoff = cos(radians(light.cone_angle * 0.5));
 
@@ -340,6 +346,77 @@ void sample_spot_light(inout Light light, inout float3 hit_point, inout uint see
     sample.light_index = -1;
     sample.valid = true;
 }
+
+uint binary_search_cdf(float rand_value, uint start_idx, uint count) {
+    uint left = 0;
+    uint right = count - 1;
+    uint result = 0;
+    
+    while (left <= right) {
+        uint mid = (left + right) >> 1;  // 除以2的位运算优化
+        float cdf_value = hdr_cdf[start_idx + mid];
+        
+        if (rand_value <= cdf_value) {
+            result = mid;
+            if (mid == 0 || rand_value > hdr_cdf[start_idx + mid - 1]) {
+                break;
+            }
+            right = mid - 1;
+        } else {
+            left = mid + 1;
+        }
+    }
+    return result;
+}
+
+void sample_hdr(inout float3 hit_point, inout uint seed, out LightSample sample) {
+    sample = (LightSample)0;
+    
+    if (render_setting.skybox_texture_id_ < 0) {
+        return;
+    }
+    
+    // 从CDF缓冲区读取宽度和高度
+    uint width = (uint)hdr_cdf[0];
+    uint height = (uint)hdr_cdf[1];
+    float hdr_total_luminance = hdr_cdf[2];
+    
+    uint cdf_offset = 3; 
+    
+    // 1. 使用二分查找采样边缘CDF（行）
+    uint marginal_cdf_start = cdf_offset + (uint)(width * height);
+    uint row = binary_search_cdf(random(seed), marginal_cdf_start, height);
+    
+    // 2. 使用二分查找采样条件CDF（列）
+    uint conditional_cdf_start = cdf_offset + row * (uint)width;
+    uint col = binary_search_cdf(random(seed), conditional_cdf_start, width);
+    
+    float u = (float(col) + 0.5) / width;
+    float v = (float(row) + 0.5) / height;
+    
+    float phi = u * TWO_PI;
+    float theta = v * PI;
+    
+    float sin_theta = sin(theta);
+    float cos_theta = cos(theta);
+    float sin_phi = sin(phi);
+    float cos_phi = cos(phi);
+    
+    float3 direction = float3(sin_theta * cos_phi, cos_theta, sin_theta * sin_phi);
+    
+    float3 hdr_color = g_Textures[render_setting.skybox_texture_id_].SampleLevel(g_Sampler, float2(u, v), 0).rgb;
+    float luminance = dot(hdr_color, float3(0.2126, 0.7152, 0.0722));
+    
+    float solid_angle_pdf = luminance * sin_theta / hdr_total_luminance;
+    
+    // 5. 设置采样结果
+    sample.position = hit_point + direction * 10000.0; // 远点
+    sample.direction = direction;
+    sample.radiance = hdr_color;
+    sample.pdf = solid_angle_pdf;
+    sample.valid = (solid_angle_pdf > 0.0) && (luminance > 0.0);
+}
+
 
 // ====================== MIS核心 ======================
 
@@ -797,14 +874,17 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
 
     if (!is_enable_lights(light_count) || mat.metallic > 0.9) return total_light;
 
-    uint sample_times = min(4, light_count);
+    uint sample_times = min(4, light_count + 1);
 
     for (int i = 0; i < sample_times; ++i) {
         // 按功率重要性采样光源
         int light_idx = sample_light_by_power(light_count, seed);
         if (light_idx < 0) continue;
         
-        Light light = lights[light_idx];
+        Light light;
+        if(light_idx < light_count) light = lights[light_idx];
+        else light.type = 4;
+
         LightSample light_sample;
 
         switch (light.type) {
@@ -812,6 +892,7 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
             case 1: sample_area_light(light, hit_point, seed, light_sample); break;
             case 2: sample_spot_light(light, hit_point, seed, light_sample); break;
             case 3: sample_sphere_light(light, hit_point, seed, light_sample); break;
+            case 4: sample_hdr(hit_point, seed, light_sample); break;
         }
 
         if (!light_sample.valid){
@@ -838,13 +919,13 @@ float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout
             // 计算光源采样PDF
             float light_select_pdf = light_power_weights[light_idx];
             float light_pdf = light_sample.pdf * light_select_pdf;
-            
+
             if (light.type == 0 || light.type == 2) {
                 // 点光源和聚光灯：直接加（delta光源）
                 total_light += light_contrib / light_pdf;
             }
             else {
-                // 面光源和球光源：使用MIS
+                // 面光源、球光源、HDR
                 float mis_weight = mis_balance_weight(light_pdf, pdf);
                 total_light += light_contrib * mis_weight / light_pdf;
             }
@@ -1003,12 +1084,12 @@ void RayGenMain() {
 
     entity_id_output[pixel_coords] = -1;
 
-    float3 prev_hit_point, prev_normal;
+    float3 prev_hit_point;
     float prev_bsdf_pdf;
     bool prev_is_specular = false;
 
     uint light_count, light_idx;
-    lights.GetDimensions(light_count, light_idx);
+    light_count = render_setting.light_count;
 
     for (int depth = 0; depth < min(render_setting.max_depth, MAX_DEPTH); ++depth) {
 
@@ -1023,53 +1104,69 @@ void RayGenMain() {
 
         if(light_idx == 0xFFFFFFFF){
             if (!payload.hit) {
-                // 天空盒
-                color += payload.color * throughput;
-                break;
+                if(render_setting.skybox_texture_id_ >= 0){
+                    light_idx = light_count;
+                }
+                else{ // no hdr
+                    color += payload.color * throughput;
+                    break;
+                }
             }
-            
-            // 记录首次命中的实体ID
-            if (depth == 0) {
-                entity_id_output[pixel_coords] = (int)payload.instance_id;
-            }
+            else{
+                // 记录首次命中的实体ID
+                if (depth == 0) {
+                    entity_id_output[pixel_coords] = (int)payload.instance_id;
+                }
 
-            mat = materials[payload.instance_id];
-            light_idx = mat.light_index;
+                mat = materials[payload.instance_id];
+                light_idx = mat.light_index;
+            }
         }
 
         float3 wo = -ray.Direction;
         
         // 处理光源命中
         if (light_idx != 0xFFFFFFFF) {
-            Light light = lights[light_idx];
+            Light light;
+            if(light_idx < light_count) light = lights[light_idx];
+            else{
+                light.enabled = true;
+                light.type = 4;
+                light.color = payload.color;
+                light.intensity = 1.0;
+            }
 
-            if(light.type != 1 || dot(wo, light.direction) > 0){
+            if(light.enabled && (light.type != 1 || dot(wo, light.direction) > 0) ){ // 单向面光源
 
-                if (depth == 0 || prev_is_specular) {
+                if (depth == 0 || prev_is_specular || !render_setting.enable_accumulation) {
                     // 第一次直接击中光源或镜面反射击中光源
-                    if (light.enabled) {
-                        color += light.color * light.intensity * throughput;
-                    }
+                    color += light.color * light.intensity * throughput;
                 } else {
                     // BSDF采样击中光源，需要MIS
-                    if (!light.enabled || (light.type != 1 && light.type != 3)) {
-                        break;
-                    }
-                    
-                    float3 to_light = payload.hit_point - prev_hit_point;
-                    float distance = length(to_light);
-                    float3 light_dir = to_light / distance;
-                    
+                    // if (light.type != 1 && light.type != 3) {
+                    //     break;
+                    // }
+                                        
                     // 计算光源采样PDF
                     float light_pdf = 0.0;
-                    float cos_theta_l = max(EPS, abs(dot(light_dir, prev_normal)));
-                    
-                    if (light.type == 1) { // 面光源
-                        float area = light.size.x * light.size.y;
-                        light_pdf = (distance * distance) / (cos_theta_l * area);
-                    } else if (light.type == 3) { // 球光源
-                        float surface_area = 4.0 * PI * light.radius * light.radius;
-                        light_pdf = (distance * distance) / (cos_theta_l * surface_area);
+
+                    if(light.type == 4){
+                        float luminance = dot(payload.color, float3(0.2126, 0.7152, 0.0722));
+                        light_pdf = luminance * sqrt(1 - sqr(-wo.y)) / hdr_cdf[2];  // sin theta
+
+                    } else{
+                        float3 to_light = payload.hit_point - prev_hit_point;
+                        float distance = length(to_light);
+                        float3 light_dir = to_light / distance;
+                        float cos_theta_l = max(EPS, abs(dot(light_dir, light.direction)));
+                        
+                        if (light.type == 1) { // 面光源
+                            float area = light.size.x * light.size.y;
+                            light_pdf = (distance * distance) / (cos_theta_l * area);
+                        } else if (light.type == 3) { // 球光源
+                            float surface_area = 4.0 * PI * light.radius * light.radius;
+                            light_pdf = (distance * distance) / (cos_theta_l * surface_area);
+                        }
                     }
                     
                     float light_select_pdf = light_power_weights[light_idx];
@@ -1088,8 +1185,10 @@ void RayGenMain() {
         prev_hit_point = payload.hit_point;
 
         // MIS直接光照
-        float3 direct_light = mis_direct_lighting(light_count, payload.hit_point, payload.normal, mat, wo, payload.is_filp, seed);
-        color += direct_light * throughput;
+        if(render_setting.enable_accumulation){
+            float3 direct_light = mis_direct_lighting(light_count, payload.hit_point, payload.normal, mat, wo, payload.is_filp, seed);
+            color += direct_light * throughput;
+        }
         
         // 处理自发光材质
         if (any(mat.emission > 0.0)) {
@@ -1117,8 +1216,6 @@ void RayGenMain() {
           color = float3(1e9, 0.0, isnan(pdf)? 1e9: 0);
           break;
         }
-
-        prev_normal = payload.normal;
         
         // 计算余弦项
         float cos_theta = dot(payload.normal, wi);
@@ -1184,7 +1281,6 @@ void MissMain(inout RayPayload payload) {
     if (render_setting.skybox_texture_id_ >= 0) {
         // 采样HDR天空盒
         float3 normalizedDir = normalize(WorldRayDirection());
-        normalizedDir.z *= -1;
         
         float phi = atan2(normalizedDir.z, normalizedDir.x);
         float theta = acos(clamp(normalizedDir.y, -1.0, 1.0));
@@ -1198,10 +1294,8 @@ void MissMain(inout RayPayload payload) {
         v = clamp(v, 0.0, 1.0);
         
         // 采样HDR纹理（索引0是天空盒纹理）
-        float3 sky_color = g_Textures[render_setting.skybox_texture_id_].SampleLevel(g_Sampler, float2(u, v), 0).rgb;
+        payload.color = g_Textures[render_setting.skybox_texture_id_].SampleLevel(g_Sampler, float2(u, v), 0).rgb;
         
-        // 应用强度
-        payload.color = sky_color * 0.5;
     } else {
         // 简化的天空渐变（原有的）
         float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);

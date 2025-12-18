@@ -2,6 +2,7 @@
 #include "long_march.h"
 #include "Scene.h"  // 需要包含Scene，用于添加实体
 #define MUL_INTENS 8
+#define MUL_INTENS_SKYBOX 0.7
 
 struct Light {
     glm::vec3 position;       // 光源位置
@@ -154,6 +155,9 @@ public:
     const std::vector<float>& GetPowerWeights() const { return power_weights_; }
     grassland::graphics::Buffer* GetPowerWeightsBuffer() const { return power_weights_buffer_.get(); }
 
+    // Set HDR Power
+    void SetHDRPower(float hdr_power){ hdr_power_ = hdr_power; }
+
 private:
     std::vector<Light> lights_;
     std::vector<std::shared_ptr<Entity>> light_entities_; // 存储可见光源的实体
@@ -173,8 +177,10 @@ private:
     std::shared_ptr<Entity> CreateLightEntity(const Light& light, size_t light_index);
     
     // 创建自发光材质
-    Material CreateEmissiveMaterial(const Light& light) const;
+    // Material CreateEmissiveMaterial(const Light& light) const;
     
     // 计算面光源的变换矩阵
     glm::mat4 CalculateAreaLightTransform(const Light& light) const;
+
+    float hdr_power_;
 };

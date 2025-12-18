@@ -30,6 +30,7 @@ struct RenderSettings {  // Mainly for random seed
     uint32_t samples_per_pixel;
     uint32_t max_depth;
     uint32_t enable_accumulation;
+    uint32_t light_count;
     // HDR
     int skybox_texture_id_;            // If not able, set to -1
 };

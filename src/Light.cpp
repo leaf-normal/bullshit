@@ -70,26 +70,43 @@ void LightManager::UpdatePowerData() {
     
     // 重置数据
     power_weights_.clear();
-    total_power_ = 0.0f;
+    total_power_ = hdr_power_;
+    float max_power = hdr_power_;
     
     // 计算每个光源的功率
     std::vector<float> powers;
-    powers.reserve(lights_.size());
+    powers.reserve(lights_.size() + 1);
     
     for (size_t i = 0; i < lights_.size(); ++i) {
         float power = CalculateLightPowerCPU(lights_[i]);
         powers.push_back(power);
         total_power_ += power;
+        max_power = std::max(max_power, hdr_power_);
     }
+
+    float low = max_power / (lights_.size() + 1) / 16;
+
+    total_power_ = hdr_power_;
+
+    for(size_t i = 0; i < lights_.size(); ++i) {
+        if(powers[i] < low){
+            grassland::LogWarning("Increase power light {} from {} to {} because power is too low", i, powers[i], low);
+            powers[i] = low;
+        }
+        total_power_ += powers[i];
+    }
+
+    powers.push_back(hdr_power_);    
     
     // 计算归一化的功率权重
     if (total_power_ > 1e-6) {
-        for (size_t i = 0; i < lights_.size(); ++i) {
+        for (size_t i = 0; i < powers.size(); ++i) {
             float weight = powers[i] / total_power_;
             power_weights_.push_back(weight);
         }
+        grassland::LogInfo("Total power is {}", total_power_);    
     } else {
-        power_weights_.resize(lights_.size(), 0.0f);
+        power_weights_.resize(powers.size(), 0.0f);
         grassland::LogWarning("Total power too low !");        
     }
     
@@ -98,7 +115,7 @@ void LightManager::UpdatePowerData() {
         power_weights_buffer_->UploadData(power_weights_.data(), 
                                          power_weights_.size() * sizeof(float));
     }
-    grassland::LogInfo("power buffer updated");
+    grassland::LogInfo("power buffer updated with {} entries", power_weights_.size());
 }
 
 void LightManager::UpdateBuffers() {
