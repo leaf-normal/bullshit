@@ -3,6 +3,7 @@
 #include "Scene.h"
 #include "Film.h"
 #include "Light.h"
+#include "TextureManager.h"
 #include <memory>
 
 struct CameraObject {
@@ -15,6 +16,12 @@ struct CameraObject {
     float focal_length;       // 焦距（控制视角）
     float lens_radius;        // 透镜半径 = aperture_size/2
     int enable_depth_of_field;// 是否启用景深效果
+
+    // 运动模糊参数 - 新增
+    glm::vec3 camera_linear_velocity;  // 相机线性速度
+    float camera_angular_velocity; // 相机角速度（绕相机方向的旋转）
+    int enable_motion_blur;            // 是否启用运动模糊
+    float exposure_time;               // 曝光时间（秒）
 };
 
 struct RenderSettings {  // Mainly for random seed
@@ -130,4 +137,21 @@ private:
     
     double wheel_accumulator_;
     bool wheel_processed_;
+
+    // 运动模糊相关
+    bool motion_blur_enabled_;          // 是否启用运动模糊
+    float exposure_time_;               // 曝光时间
+    glm::vec3 camera_linear_velocity_;  // 相机线性速度
+    float camera_angular_velocity_; // 相机角速度
+    
+    // 运动参数UI
+    bool motion_blur_ui_open_;
+    float temp_exposure_time_;
+    glm::vec3 temp_camera_linear_velocity_;
+    float temp_camera_angular_velocity_;
+        
+    // 应用运动模糊参数
+    void ApplyMotionBlurParams();
+
+    std::unique_ptr<TextureManager> texture_manager_;
 };

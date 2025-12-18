@@ -16,5 +16,9 @@ struct VertexInfo {
 
     VertexInfo(const glm::vec3& pos, const glm::vec3& n)
         : position(pos)
-        , normal(n) {}
+        , normal(n){}
+        
+    VertexInfo(const glm::vec3& pos, const glm::vec3& n, const glm::vec2& t)
+        : position(pos)
+        , normal(n){}
 };

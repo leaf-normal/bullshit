@@ -1,1160 +1,1220 @@
-#include "app.h"
-#include "Material.h"
-#include "Entity.h"
+struct CameraInfo {
+  float4x4 screen_to_camera;
+  float4x4 camera_to_world;
+  float focal_distance;     // 焦点距离（世界空间）
+  float aperture_size;      // 光圈直径（控制模糊强度）
+  float focal_length;       // 焦距（控制视角）
+  float lens_radius;        // 透镜半径 = aperture_size/2
+  int enable_depth_of_field;
 
-#include "glm/gtc/matrix_transform.hpp"
-#include "imgui.h"
+  float3 camera_linear_velocity;  // 相机线性速度
+  float camera_angular_velocity; // 相机角速度（绕相机方向的旋转）
+  int enable_motion_blur;            // 是否启用运动模糊
+  float exposure_time;    
+};
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+struct Material {
+  float3 base_color;
+  float roughness;
+  float metallic;
+  uint light_index;
+  
+  float3 emission;          // 自发光颜色
+  float ior;                // 折射率
+  float transparency;       // 透明度 
+  int texture_id;
+  
+  float subsurface;     //次表面散射
+  float specular;      //镜面反射强度
+  float specular_tint; //镜面反射
+  float anisotropic;   //各向异性[-1,1]
+  float sheen;         //光泽层
+  float sheen_tint;    //光泽层染色
+  float clearcoat;     //清漆层强度
+  float clearcoat_roughness; //清漆层粗糙度
 
-#include <chrono>
-#include <iomanip>
-#include <sstream>
-#include <filesystem>
+  uint group_id;
+};
 
-namespace {
-#include "built_in_shaders.inl"
+struct HoverInfo {
+  int hovered_entity_id;
+};
+
+// ====================== 常量缓冲区定义 ======================
+
+#define MAX_MOTION_GROUPS 1
+
+RaytracingAccelerationStructure as : register(t0, space0);
+RWTexture2D<float4> output : register(u0, space1);
+ConstantBuffer<CameraInfo> camera_info : register(b0, space2);
+StructuredBuffer<Material> materials : register(t0, space3);
+ConstantBuffer<HoverInfo> hover_info : register(b0, space4);
+RWTexture2D<int> entity_id_output : register(u0, space5);
+RWTexture2D<float4> accumulated_color : register(u0, space6);
+RWTexture2D<int> accumulated_samples : register(u0, space7);
+
+struct GeometryDescriptor {
+    uint vertex_offset;
+    uint index_offset;
+    uint vertex_count;
+    uint index_count;
+};
+
+struct VertexInfo {
+    float3 position;
+    float3 normal;    
+};
+
+StructuredBuffer<GeometryDescriptor> geometry_descriptors : register(t0, space8);
+StructuredBuffer<VertexInfo> vertices : register(t0, space9);
+StructuredBuffer<uint> indices : register(t0, space10);
+
+struct RenderSettings {
+    uint frame_count;
+    uint samples_per_pixel;
+    uint max_depth;
+    uint enable_accumulation;
+};
+
+ConstantBuffer<RenderSettings> render_setting : register(b0, space11);
+
+// ====================== 光源系统 ======================
+#define MAX_LIGHTS 32
+
+struct Light {
+    float3 position;       // 光源位置
+    float3 direction;      // 方向向量：
+                             // - 点光源：不使用（置0）
+                             // - 面光源：法线方向（单向）
+                             // - 聚光灯：光照方向
+    float3 tangent;        // 面光源的切向量，保证正交归一化
+    float3 color;          // 光源颜色
+    float intensity;          // 辐射亮度（面光源，球光源） / 辐射强度（点光源，聚光灯）
+    float2 size;           // 面光源尺寸(矩形-长宽)
+    float radius;             // 球光源半径
+    float cone_angle; 
+    uint type;                 // 0=点光源, 1=面光源, 2=聚光灯, 3=球光源
+    uint enabled;             // 光源是否启用
+    uint visible;             // 光源是否可见
+};
+
+StructuredBuffer<Light> lights : register(t0, space12);
+StructuredBuffer<float> light_power_weights : register(t0, space13);
+
+// 物体运动
+
+struct MotionParams {
+    float3 linear_velocity;
+    float3 angular_velocity;
+    float3 pivot_point;          
+    int is_static;
+    int group_id; 
+};
+StructuredBuffer<MotionParams> motion_groups : register(t0, space14);
+Texture2D<float4> g_Textures[128] : register(t0, space18);
+SamplerState g_Sampler : register(s0, space18);
+
+
+
+struct RayPayload {
+  float3 color;
+  bool hit;
+  uint instance_id;
+  float3 normal;
+  float3 hit_point;
+  bool is_filp;
+};
+
+// ====================== 常量定义 ======================
+#define MAX_DEPTH 8
+#define RR_THRESHOLD 0.95f
+#define t_min 1e-3
+#define t_max 10000.0
+#define eps 5e-4 // used for geometry
+#define EPS 1e-6 // used for division
+#define PI 3.14159265359
+#define TWO_PI 6.28318530718
+#define INV_PI 0.31830988618
+
+// ====================== 随机数生成 ======================
+uint pcg_hash(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
 }
 
-Application::Application(grassland::graphics::BackendAPI api) 
-    : frame_count_(0)
-    , samples_per_pixel_(1)
-    // 实际景深参数
-    , focal_distance_(5.0f)
-    , aperture_size_(0.1f)
-    , focal_length_(0.035f)
-    // 临时景深参数（初始化为实际值）
-    , temp_focal_distance_(5.0f)
-    , temp_aperture_size_(0.1f)
-    , temp_focal_length_(0.035f)
-    // 状态标志
-    , depth_of_field_enabled_(false)
-    , depth_of_field_ui_open_(false)
-    // 滚轮状态
-    , wheel_accumulator_(0.0)
-    , wheel_processed_(true) {
-
-    grassland::graphics::CreateCore(api, grassland::graphics::Core::Settings{}, &core_);
-    core_->InitializeLogicalDeviceAutoSelect(true);
-
-    grassland::LogInfo("Device Name: {}", core_->DeviceName());
-    grassland::LogInfo("- Ray Tracing Support: {}", core_->DeviceRayTracingSupport());
+float random(inout uint seed) {
+    return (float)pcg_hash(seed) / 4294967296.0;
 }
 
-Application::~Application() {
-    core_.reset();
+float2 random2(inout uint seed) {
+    return float2(random(seed), random(seed));
 }
 
-// Event handler for keyboard input
-void Application::ProcessInput() {
-    GLFWwindow* glfw_window = window_->GLFWWindow();
-    
-    if (glfwGetWindowAttrib(glfw_window, GLFW_FOCUSED) == GLFW_FALSE) {
-        return;
-    }
-
-    // Tab key to toggle UI visibility (only in inspection mode)
-    if (!camera_enabled_) {
-        ui_hidden_ = (glfwGetKey(glfw_window, GLFW_KEY_TAB) == GLFW_PRESS);
-    }
-    
-    // Ctrl+S to save accumulated output (only in inspection mode)
-    static bool ctrl_s_was_pressed = false;
-    bool ctrl_pressed = (glfwGetKey(glfw_window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS || 
-                        glfwGetKey(glfw_window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
-    bool s_pressed = (glfwGetKey(glfw_window, GLFW_KEY_S) == GLFW_PRESS);
-    bool ctrl_s_pressed = ctrl_pressed && s_pressed;
-    
-    if (ctrl_s_pressed && !ctrl_s_was_pressed && !camera_enabled_) {
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm;
-        localtime_s(&tm, &time_t);
-        
-        std::ostringstream filename;
-        filename << "screenshot_" 
-                 << std::put_time(&tm, "%Y%m%d_%H%M%S")
-                 << ".png";
-        
-        SaveAccumulatedOutput(filename.str());
-    }
-    ctrl_s_was_pressed = ctrl_s_pressed;
-    
-    // Only process camera movement if camera is enabled
-    if (camera_enabled_) {
-        // Poll key states directly
-        if (glfwGetKey(glfw_window, GLFW_KEY_W) == GLFW_PRESS) {
-            camera_pos_ += camera_speed_ * camera_front_;
-        }
-        if (glfwGetKey(glfw_window, GLFW_KEY_S) == GLFW_PRESS) {
-            camera_pos_ -= camera_speed_ * camera_front_;
-        }
-        if (glfwGetKey(glfw_window, GLFW_KEY_A) == GLFW_PRESS) {
-            camera_pos_ -= glm::normalize(glm::cross(camera_front_, camera_up_)) * camera_speed_;
-        }
-        if (glfwGetKey(glfw_window, GLFW_KEY_D) == GLFW_PRESS) {
-            camera_pos_ += glm::normalize(glm::cross(camera_front_, camera_up_)) * camera_speed_;
-        }
-        if (glfwGetKey(glfw_window, GLFW_KEY_SPACE) == GLFW_PRESS) {
-            camera_pos_ += camera_speed_ * camera_up_;
-        }
-        if (glfwGetKey(glfw_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || 
-            glfwGetKey(glfw_window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
-            camera_pos_ -= camera_speed_ * camera_up_;
-        }
-    }
-
-    // start of modification 
-    // F键切换景深效果
-    static bool f_was_pressed = false;
-    bool f_pressed = (glfwGetKey(glfw_window, GLFW_KEY_F) == GLFW_PRESS);
-    
-    if (f_pressed && !f_was_pressed && !camera_enabled_) {
-        depth_of_field_enabled_ = !depth_of_field_enabled_;
-        if (depth_of_field_enabled_) {
-            grassland::LogInfo("Depth of Field enabled");
-        } else {
-            grassland::LogInfo("Depth of Field disabled");
-        }
-        film_->Reset();
-        frame_count_ = 0;
-    }
-    f_was_pressed = f_pressed;
-    
-    if (!wheel_processed_ && abs(wheel_accumulator_) > 0.01) {
-        if (depth_of_field_enabled_ && !camera_enabled_) {
-            float wheel_sensitivity = 0.25f;
-            
-            // 直接更新实际参数（滚轮是实时调整）
-            focal_distance_ += static_cast<float>(wheel_accumulator_) * wheel_sensitivity;
-            focal_distance_ = glm::clamp(focal_distance_, 0.05f, 500.0f);
-            
-            // 同时更新临时参数，保持UI显示一致
-            temp_focal_distance_ = focal_distance_;
-            
-            // 重置累积渲染
-            film_->Reset();
-            frame_count_ = 0;
-        }
-        
-        // 重置滚轮状态
-        wheel_accumulator_ = 0.0;
-        wheel_processed_ = true;
-    }
-
-    // end of modification
+uint generate_seed(uint2 pixel, uint frame) {
+    return (pixel.x * 1973u + pixel.y * 9277u + frame * 26699u) ^ 0x6f5ca34du;
 }
 
-void Application::OnMouseMove(double xpos, double ypos) {
-    mouse_x_ = xpos;
-    mouse_y_ = ypos;
+// ====================== 光源采样系统 ======================
+struct LightSample {
+    float3 position;
+    float3 direction;
+    float3 radiance;
+    float pdf;
+    int light_index;
+    bool valid;
+};
 
-    if (!camera_enabled_) {
-        return;
+bool is_enable_lights(inout uint light_count){
+  for(int i = 0; i < light_count; ++i){
+    if(light_power_weights[i] > 0.0){
+      return true;
     }
-
-    if (first_mouse_) {
-        last_x_ = (float)xpos;
-        last_y_ = (float)ypos;
-        first_mouse_ = false;
-        return;
-    }
-
-    float xoffset = (float)xpos - last_x_;
-    float yoffset = last_y_ - (float)ypos;
-    last_x_ = (float)xpos;
-    last_y_ = (float)ypos;
-
-    xoffset *= mouse_sensitivity_;
-    yoffset *= mouse_sensitivity_;
-
-    yaw_ += xoffset;
-    pitch_ += yoffset;
-
-    if (pitch_ > 89.0f)
-        pitch_ = 89.0f;
-    if (pitch_ < -89.0f)
-        pitch_ = -89.0f;
-
-    glm::vec3 front;
-    front.x = cos(glm::radians(yaw_)) * cos(glm::radians(pitch_));
-    front.y = sin(glm::radians(pitch_));
-    front.z = sin(glm::radians(yaw_)) * cos(glm::radians(pitch_));
-    camera_front_ = glm::normalize(front);
+  }
+  return false;
 }
 
-void Application::OnMouseButton(int button, int action, int mods, double xpos, double ypos) {
-    const int BUTTON_LEFT = 0;
-    const int BUTTON_RIGHT = 1;
-    const int ACTION_PRESS = 1;
-
-    if (button == BUTTON_LEFT && action == ACTION_PRESS && !camera_enabled_) {
-        if (hovered_entity_id_ >= 0) {
-            selected_entity_id_ = hovered_entity_id_;
-            grassland::LogInfo("Selected Entity #{}", selected_entity_id_);
-        } else {
-            selected_entity_id_ = -1;
-            grassland::LogInfo("Deselected entity");
-        }
-    }
-
-    if (button == BUTTON_RIGHT && action == ACTION_PRESS) {
-        camera_enabled_ = !camera_enabled_;
-        
-        GLFWwindow* glfw_window = window_->GLFWWindow();
-        
-        if (camera_enabled_) {
-            glfwSetInputMode(glfw_window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-            first_mouse_ = true;
-            grassland::LogInfo("Camera mode enabled - use WASD/Space/Shift to move, mouse to look");
-        } else {
-            glfwSetInputMode(glfw_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-            grassland::LogInfo("Camera mode disabled - cursor visible, showing info overlay");
-        }
-    }
-}
-// start of modification
-void Application::OnScroll(double xoffset, double yoffset) {
-    wheel_accumulator_ += yoffset;
-    wheel_processed_ = false;
+// 按功率重要性采样光源
+int sample_light_by_power(inout uint light_count, inout uint seed) {
     
-    // grassland::LogInfo("Scroll: x={:.2f}, y={:.2f}, accumulator={:.2f}", 
-    //                   xoffset, yoffset, wheel_accumulator_);
+    // 使用预计算的权重进行采样
+    float u = random(seed);
+    uint last = 0;
+    
+    for (int i = 0; i < light_count; i++) {
+        if(light_power_weights[i] > 0.0){
+          u -= light_power_weights[i];
+          if (u <= 0) {
+              return i;
+          }
+          last = i;    
+        }
+
+    }
+    
+    // 浮点误差保护
+    return last;
 }
 
-void Application::ApplyDepthOfFieldParams() {
-    // 检查参数是否有效
-    bool valid = true;
+void sample_point_light(inout Light light, inout float3 hit_point, inout uint seed, out LightSample sample) {
+    sample = (LightSample)0;
     
-    if (temp_focal_distance_ < 0.05f || temp_focal_distance_ > 500.0f) {
-        grassland::LogWarning("Focus distance must be between 0.05 and 500.0m");
-        valid = false;
-    }
+    if (!light.enabled) return;
     
-    if (temp_aperture_size_ < 0.001f || temp_aperture_size_ > 5f) {
-        grassland::LogWarning("Aperture must be between 0.001 and 5m");
-        valid = false;
-    }
+    float3 to_light = light.position - hit_point;
+    float distance = length(to_light);
     
-    if (temp_focal_length_ < 0.01f || temp_focal_length_ > 2f) {
-        grassland::LogWarning("Focal length must be between 10 and 2000mm");
-        valid = false;
-    }
+    if (distance < 1e-6) return;
     
-    if (!valid) {
-        return; // 参数无效，不应用
-    }
+    sample.position = light.position;
+    sample.direction = to_light / distance;
     
-    // 应用参数
-    focal_distance_ = temp_focal_distance_;
-    aperture_size_ = temp_aperture_size_;
-    focal_length_ = temp_focal_length_;
+    // 物理正确的辐射亮度（朗伯体点光源）
+    sample.radiance = light.color * light.intensity / (distance * distance + 1e-6);
     
-    // 重置累积渲染
-    if (!camera_enabled_) {
-        film_->Reset();
-        frame_count_ = 0;
-    }
-    
-    grassland::LogInfo("Depth of field parameters applied:");
-    grassland::LogInfo("  Focus distance: {:.2f}m", focal_distance_);
-    grassland::LogInfo("  Aperture: {:.3f}m (f/{:.1f})", 
-                       aperture_size_, focal_length_ / aperture_size_);
-    grassland::LogInfo("  Focal length: {:.0f}mm", focal_length_ * 1000.0f);
+    sample.pdf = 1;
+    sample.light_index = -1; // 将由调用者设置
+    sample.valid = true;
 }
-// end of modification
 
-void Application::OnInit() {
-    alive_ = true;
-    core_->CreateWindowObject(1920, 1080,
-        ((core_->API() == grassland::graphics::BACKEND_API_VULKAN) ? "[Vulkan]" : "[D3D12]") +
-        std::string(" Ray Tracing Scene Demo"),
-        &window_);
-
-    window_->InitImGui();
-
-    window_->MouseMoveEvent().RegisterCallback(
-        [this](double xpos, double ypos) {
-            this->OnMouseMove(xpos, ypos);
-        }
-    );
-    window_->MouseButtonEvent().RegisterCallback(
-        [this](int button, int action, int mods, double xpos, double ypos) {
-            this->OnMouseButton(button, action, mods, xpos, ypos);
-        }
-    );
-    window_->ScrollEvent().RegisterCallback(
-        [this](double xoffset, double yoffset) {
-            this->OnScroll(xoffset, yoffset);
-        }
-    );
-
-    camera_enabled_ = false;
-    last_camera_enabled_ = false;
-    ui_hidden_ = false;
-    hovered_entity_id_ = -1;
-    hovered_pixel_color_ = glm::vec4(0.0f);
-    selected_entity_id_ = -1;
-    mouse_x_ = 0.0;
-    mouse_y_ = 0.0;
+// 面光源采样 - 使用切向量
+void sample_area_light(inout Light light, inout float3 hit_point, inout uint seed, out LightSample sample) {
+    sample = (LightSample)0;
     
-    // 初始化渲染设置
-    core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
+    if (!light.enabled || light.size.x <= 0.0 || light.size.y <= 0.0) return;
     
-    RenderSettings initial_settings{};
-    initial_settings.frame_count = 0;
-    initial_settings.samples_per_pixel = samples_per_pixel_;
-    initial_settings.max_depth = 8;
-    initial_settings.enable_accumulation = 1;
-    render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
+    // 构建局部坐标系
+    float3 bitangent = normalize(cross(light.direction, light.tangent));
 
-    // 创建场景
-    scene_ = std::make_unique<Scene>(core_.get());
-
-        // 初始化光源管理器
-    light_manager_ = std::make_unique<LightManager>();
-    light_manager_->Initialize(core_.get(), scene_.get());
+    // 在矩形上均匀采样（面积采样）
+    float3 local_pos = float3((random(seed) - 0.5) * light.size.x, 
+                              (random(seed) - 0.5) * light.size.y, 
+                              0.0);
     
-    // 添加默认光源
-    light_manager_->CreateDefaultLights();
+    // 转换到世界空间
+    sample.position = light.position + 
+                     local_pos.x * light.tangent + 
+                     local_pos.y * bitangent;
+    
+    // 计算方向、距离、余弦项
+    float3 to_light = sample.position - hit_point;
+    float distance = length(to_light);
+    sample.direction = to_light / distance;
+    
+    // 检查可见性（面光源只有一面发光）
+    float cos_theta_l = dot(-sample.direction, light.direction);
+    if (cos_theta_l <= 0.0) {
+        sample.valid = 0;
+        return; // 从背面看不到
+    }
+    
+    // 几何项
+    float area = light.size.x * light.size.y;
+    
+    // 物理正确的辐射亮度（朗伯体面光源）
+    sample.radiance = light.color * light.intensity;
+    
+    // PDF转换：面积PDF -> 立体角PDF
+    float solid_angle_pdf = (distance * distance) / (cos_theta_l * area);
+    sample.pdf = solid_angle_pdf;
+    
+    sample.light_index = -1;
+    sample.valid = (sample.pdf > 0.0);
+}
 
-    // 添加实体
+// 球光源采样 - 新增
+void sample_sphere_light(inout Light light, inout float3 hit_point, inout uint seed, out LightSample sample) {
+    sample = (LightSample)0;
+    
+    if (!light.enabled || light.radius <= 0.0) return;
+    
+    // 在球面上均匀采样
+    float z = 2.0 * random(seed) - 1.0;
+    float phi = TWO_PI * random(seed);
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    
+    float3 sphere_dir = float3(r * cos(phi), r * sin(phi), z);
+    
+    // 转换到世界空间
+    sample.position = light.position + light.radius * sphere_dir;
+    
+    // 计算方向、距离、余弦项
+    float3 to_light = sample.position - hit_point;
+    float distance = length(to_light);
+    sample.direction = to_light / distance;
+    
+    // 球面法线（指向外）
+    float3 sphere_normal = sphere_dir;
+    float cos_theta_l = max(0.0, dot(-sample.direction, sphere_normal));
+    if (cos_theta_l <= 0.0) {
+        return; // 从背面看不到
+    }
+    
+    // 几何项
+    float surface_area = 4.0 * PI * light.radius * light.radius;
+    
+    // 物理正确的辐射亮度（朗伯体球光源）
+    sample.radiance = light.color * light.intensity;
+    
+    // PDF转换：面积PDF -> 立体角PDF
+    float area_pdf = 1.0 / surface_area;
+    float solid_angle_pdf = (distance * distance) / (cos_theta_l * surface_area);
+    sample.pdf = solid_angle_pdf;
+    
+    sample.light_index = -1;
+    sample.valid = (sample.pdf > 0.0);
+}
+
+void sample_spot_light(inout Light light, inout float3 hit_point, inout uint seed, out LightSample sample) {
+    sample = (LightSample)0;
+    
+    if (!light.enabled) return;
+    
+    float3 to_light = light.position - hit_point;
+    float distance = length(to_light);
+    
+    if (distance < 1e-6) return;
+
+    sample.position = light.position;
+    sample.direction = normalize(to_light);
+    
+    // // 锥角检查
+    float cos_angle = dot(-sample.direction, light.direction);
+    float cos_cutoff = cos(radians(light.cone_angle * 0.5));
+
+    if (cos_angle < cos_cutoff) {
+        return; // 在锥角外
+    }
+    
+    // 平滑过渡
+    float epsilon = 0.1 * (1.0 - cos_cutoff);
+    float spot_factor = smoothstep(cos_cutoff, cos_cutoff + epsilon, cos_angle);
+    
+    // // 物理正确的辐射亮度
+    float solid_angle = 2.0 * PI * (1.0 - cos_cutoff);
+    sample.radiance = light.color * light.intensity * spot_factor / (distance * distance + 1e-6);
+    
+    sample.pdf = 1.0;  
+    sample.light_index = -1;
+    sample.valid = true;
+}
+
+// ====================== MIS核心 ======================
+
+// 平衡启发式 MIS 权重
+float mis_balance_weight(float pdf_a, float pdf_b) {
+    float total = pdf_a + pdf_b ;
+    return total > 0.0 ? pdf_a / total : 0.0;
+}
+
+// 功率启发式 MIS 权重
+float mis_power_weight(float pdf_a, float pdf_b) {
+    float w = pdf_a * pdf_a ; // β=2
+    float total = w + pdf_b * pdf_b ;
+    return total > 0.0 ? w / total : 0.0;
+}
+
+// ====================== BSDF系统 ======================
+float f3_max(inout float3 u){
+  return max(u[0], max(u[1], u[2]));
+}
+float sqr(float x)
+{
+  return x*x;
+}
+float3 sqr(float3 x)
+{
+  return x*x;
+}
+bool Refract(float3 v, float3 n, float eta, out float3 t) {
+    float c = dot(v, n);
+    float k = 1.0 - eta * eta * (1.0 - c * c);
+    if (k < 0.0) return false; // 全反射 (TIR)
+    t = eta * v - (eta * c + sqrt(k)) * n;
+    return true;
+}
+
+float SchlickWeight(float cosTheta)
+{
+  return pow( clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+float SchlickFresnelScalar(float F0, float cosTheta)
+{
+  return F0 + (1.0 - F0) * SchlickWeight(cosTheta);
+}
+float3 SchlickFresnel(float3 F0, float cosTheta)
+{
+  return F0 + (1.0 - F0) * SchlickWeight(cosTheta);
+}
+float GTR1(float NdotH, float a)
+{
+  if(a >= 1.0) return INV_PI;
+  float a2 = sqr(a);
+  float t = 1.0 + (a2 - 1.0) * sqr(NdotH);
+  return (a2 - 1.0) / (PI * log(a2 + EPS) * t + EPS);
+}
+float GTR2(float NdotH, float a)
+{
+    float a2 = sqr(a);
+    float t = 1.0 + (a2 - 1.0) * sqr(NdotH);
+    return a2 / (PI * sqr(t) + EPS);
+}
+float GTR2_Anisotropic(float NdotH, float HdotX, float HdotY, float ax, float ay)
+{
+    return 1.0 / (PI * ax * ay * sqr(sqr(HdotX / ax) + sqr(HdotY / ay) + NdotH * NdotH) + EPS);
+}
+
+float SmithG_GGX(float NdotV, float alphaG) {
+    float a=sqr(alphaG);
+    float b=sqr(NdotV);
+    return 2.0*NdotV/(NdotV+sqrt(a+(1.0-a)*b) + EPS);
+}
+float SmithG_GGX_Anisotropic(float NdotV, float VdotX, float VdotY, float ax, float ay)
+{
+    return 2.0*NdotV/(NdotV+sqrt(sqr(VdotX*ax)+sqr(VdotY*ay)+sqr(NdotV)) + EPS);
+}
+float SmithG_GGX_Correlated(float NdotV, float NdotL, float alpha)
+{
+    NdotV = max(NdotV, EPS);
+    NdotL = max(NdotL, EPS);
+    float a2 = alpha * alpha;
+    float lambdaV = (-1.0 + sqrt(1.0 + a2 * (1.0 - NdotV * NdotV) / (NdotV * NdotV))) * 0.5;
+    float lambdaL = (-1.0 + sqrt(1.0 + a2 * (1.0 - NdotL * NdotL) / (NdotL * NdotL))) * 0.5;
+    float G = 1.0 / (1.0 + lambdaV + lambdaL);
+    return G;
+}
+float SmithG_GGX_Correlated_Anisotropic(float NdotV,float NdotL,float VdotX,float VdotY,float LdotX,float LdotY,float ax,float ay)
+{
+    NdotV = max(NdotV, EPS);
+    NdotL = max(NdotL, EPS);
+    float lambdaV = (-1.0 + sqrt(1.0 + (sqr(VdotX * ax) + sqr(VdotY * ay)) / sqr(NdotV))) * 0.5;
+    float lambdaL = (-1.0 + sqrt(1.0 + (sqr(LdotX * ax) + sqr(LdotY * ay)) / sqr(NdotL))) * 0.5;
+    float G = 1.0 / (1.0 + lambdaV + lambdaL);
+    return G;
+}
+float3 SampleHemisphereCos(float2 randd, inout float3 normal)
+{
+  float r=sqrt(randd.x);
+  float theta=2.0*PI*randd.y;
+  float x=r*cos(theta);
+  float y=r*sin(theta);
+  float z=sqrt(max(0.0,1.0-randd.x));
+  float3 up=abs(normal.z)<1-eps?float3(0.0,0.0,1.0):float3(1.0,0.0,0.0);
+  float3 tangent=normalize(cross(up, normal));
+  float3 bitangent=cross(normal,tangent);
+  return normalize(x*tangent+y*bitangent+z*normal);
+}
+
+float3 SampleGGX_VNDF(inout float3 ray, float roughness, float2 rd, inout float3 normal)
+{ 
+  float3 V=ray;
+  float alpha=sqr(roughness);
+  float3 Vh=normalize(float3(alpha*V.x,alpha*V.y,V.z));
+  float3 up=abs(Vh.z)<1-eps?float3(0.0,0.0,1.0):float3(1.0,0.0,0.0);
+  float3 T1=normalize(cross(up,Vh));
+  float3 T2=cross(Vh,T1);
+  float r=sqrt(rd.x);
+  float phi=2.0*PI*rd.y;
+  float t1=r*cos(phi);
+  float t2=r*sin(phi);
+  float s=0.5*(1.0+Vh.z);
+  t2=(1.0-s)*sqrt(1.0-sqr(t1))+s*t2;
+  float3 Nh=t1*T1+t2*T2+sqrt(max(0.0,1.0-sqr(t1)-sqr(t2)))*Vh;
+  float3 H=normalize(float3(alpha*Nh.x,alpha*Nh.y,max(0.0,Nh.z)));
+  return H;
+}
+float3 SampleGGX_Anisotropic(float3 ray, float roughness, float anisotropic, float2 rd, float3 normal, float3 tangent)
+{
+
+    float3 bitangent = cross(normal, tangent);
+
+    float3 V_local = normalize(float3(dot(ray, tangent), dot(ray, bitangent), dot(ray, normal)));
+
+    float aspect = sqrt(1.0 - 0.9 * anisotropic);
+    float ax = max(eps, roughness / aspect);
+    float ay = max(eps, roughness * aspect);
+    float3 Vh = normalize(float3(ax * V_local.x, ay * V_local.y, V_local.z));
+    float3 up = abs(Vh.z) < 1.0 - eps ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 T1 = normalize(cross(up, Vh));
+    float3 T2 = cross(Vh, T1);
+    float r = sqrt(rd.x);
+    float phi = 2.0 * PI * rd.y;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+    float Nh_len = sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2));
+    float3 Nh = t1 * T1 + t2 * T2 + Nh_len * Vh;
+    float3 H_local = normalize(float3(ax * Nh.x, ay * Nh.y, max(0.0, Nh.z)));
+    float3 H_world = H_local.x * tangent + H_local.y * bitangent + H_local.z * normal;
+    return H_world;
+}
+
+void GetTangent(inout float3 normal, out float3 tangent, out float3 bitangent)
+{
+  float3 up=abs(normal.z)<0.999?float3(0.0,0.0,1.0):float3(1.0,0.0,0.0);
+  tangent=normalize(cross(up,normal));
+  bitangent=cross(normal,tangent);
+}
+
+// --- 新增的透射相关辅助函数 (修正版) ---
+
+
+float3 SampleGGX_Distribution(float roughness, float2 rd, inout float3 normal, inout float3 tangent, inout float3 bitangent)
+{
+    float a = sqr(roughness);
+    float a2 = sqr(a);
+    float phi = 2.0 * PI * rd.y;
+    float cos_theta = sqrt((1.0 - rd.x) / (1.0 - rd.x + a2 * rd.x));
+    float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    float3 H_local = float3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta);
+    float3 H_world = H_local.x * tangent + H_local.y * bitangent + H_local.z * normal;
+    return normalize(H_world);
+}
+
+
+bool SampleBSDF(inout Material mat, inout float3 ray, inout float3 normal, out float3 wi, bool is_flip, inout uint seed){
+
+  //lobe权重
+  float diffuseweight=(1.0-mat.metallic)*(1.0-mat.transparency);//漫反射
+  float specularweight=lerp(0.04, 1.0, mat.metallic)*(1.0-mat.transparency);
+  float transmissionweight=mat.transparency*(1.0-mat.metallic);//透射
+  float clearcoatweight=0.25*mat.clearcoat*(1.0-mat.transparency);//清漆层
+  float sheenweight=mat.sheen*(1.0-mat.metallic)*(1.0-mat.transparency);//光泽层
+  //normalization
+  float total=diffuseweight+specularweight+transmissionweight+sheenweight+clearcoatweight;
+  diffuseweight/=total;
+  specularweight/=total;
+  transmissionweight/=total;
+  sheenweight/=total;
+  clearcoatweight/=total;
+  float randLobe=random(seed);
+  float3 tangent, bitangent;
+  GetTangent(normal, tangent, bitangent);  
+  if(randLobe<diffuseweight+sheenweight)//漫反射+简化光泽层模型
+  {
+    wi=SampleHemisphereCos(random2(seed),normal);
+  }else if(randLobe<diffuseweight+specularweight+sheenweight)//镜面反射
+  {
+    float3 H;
+    H=SampleGGX_Anisotropic(ray,mat.roughness,mat.anisotropic,random2(seed),normal,tangent);
+    wi=reflect(-ray,H);
+    if(dot(normal,wi)<=0.0)return 0;
+  }else if(randLobe<diffuseweight+specularweight+transmissionweight+sheenweight)//透射
+  {
+    float eta=(!is_flip)?1.0/mat.ior:mat.ior;
+    float3 H=SampleGGX_Distribution(mat.roughness, random2(seed), normal, tangent, bitangent);//后续可以继续改为VNDF
+    if(Refract(-ray,H,eta,wi)==false)
     {
-        auto ground = std::make_shared<Entity>(
-            "meshes/cube.obj",
-            Material(glm::vec3(0.8f, 0.8f, 0.8f), 0.4f, 0.2f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.6
-            // Material(glm::vec3(0.8f, 0.8f, 0.8f), 0.15f, 0.5f,
-            // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.9
-        ),
-            glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.8f, 0.0f)), 
-                      glm::vec3(10.0f, 0.1f, 10.0f))
-        );
-        scene_->AddEntity(ground);
+        wi=reflect(-ray,H);//全反射
+        if(dot(normal,wi)<=0.0)return 0;
     }
+  }else{//清漆
+    float alpha_c=max(EPS, mat.clearcoat_roughness);
+    float3 H=SampleGGX_Distribution(alpha_c,random2(seed),normal,tangent,bitangent);
+    wi=reflect(-ray,H);
+    if(dot(normal,wi)<=0.0)return 0;
+  }
+  wi=normalize(wi);
+  return 1;
+}
 
+float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout float3 normal, bool is_flip, out float pdf)
+{
+
+  float3 ret=float3(0.0,0.0,0.0);
+  float3 tangent,bitangent;
+  float3 F0=lerp(0.08*mat.specular,mat.base_color,mat.metallic);
+  GetTangent(normal,tangent,bitangent);
+  float Ndotray=dot(normal,ray);
+  float Ndotwi=dot(normal,wi);
+  bool is_trans=(Ndotray*Ndotwi)<0.0;
+  if(Ndotray<=0.0)
+  {
+    pdf=0.0;
+    return float3(1e9,0.0,0.0);
+  }
+  if(!is_trans&&Ndotwi<=0.0)
+  {
+    pdf=0.0;
+    return float3(0.0,0.0,0.0);
+  }
+  float alpha=sqr(mat.roughness);
+  float transmissionPDF=0.0;
+  float specularPDF=0.0;
+  float diffusePDF=0.0;
+  float sheenPDF=0.0;
+  float clearcoatPDF=0.0;
+  
+  //lobe权重
+  float diffuseweight=(1.0-mat.metallic)*(1.0-mat.transparency);//漫反射
+  float specularweight=lerp(0.04, 1.0, mat.metallic)*(1.0-mat.transparency);
+  float transmissionweight=mat.transparency*(1.0-mat.metallic);//透射
+  float sheenweight=mat.sheen*(1.0-mat.metallic)*(1.0-mat.transparency);//光泽层
+  float clearcoatweight=0.25*mat.clearcoat*(1.0-mat.transparency);//清漆层  
+  //normalization
+  float total=diffuseweight+specularweight+transmissionweight+sheenweight+clearcoatweight;
+  diffuseweight/=total;
+  specularweight/=total;
+  transmissionweight/=total;
+  sheenweight/=total;
+  if(is_trans)//透射
+  {
+    float n1 = is_flip ? mat.ior : 1.0; // V 侧 (Camera 侧)
+    float n2 = is_flip ? 1.0 : mat.ior; // L 侧 (Light 侧)
+    float3 V = ray;
+    float3 L = wi;
+    float3 H = -(n1 * V + n2 * L);
+    if (dot(H, H) < EPS) {
+        pdf = 0.0;
+        return float3(0.0, 0.0, 0.0);
+    }
+    H = normalize(H);
+    float VdotH = dot(V, H);
+    float LdotH = dot(L, H);
+    float NdotH = dot(normal, H);
+    float NdotV = dot(normal, V);
+    float NdotL = dot(normal, L);
+    float D = GTR2(NdotH, mat.roughness); // 使用你现有的 GGX D
+    float G = SmithG_GGX_Correlated(abs(NdotV), abs(NdotL), mat.roughness); // 你的 G
+    float3 F_color = SchlickFresnel(F0, abs(VdotH)); 
+    float3 T_color = 1.0 - F_color; // 透射颜色
+    float sqrtDenom = n1 * VdotH + n2 * LdotH;
+    float commonDenom = sqrtDenom * sqrtDenom + EPS;
+    float factor = (abs(VdotH) * abs(LdotH) * n2 * n2) / (abs(NdotV) * abs(NdotL) * commonDenom);
+    ret += mat.base_color * T_color * D * G * factor * transmissionweight;
+    float jacobian = (n2 * n2 * abs(LdotH)) / commonDenom;
+    transmissionPDF = D * abs(NdotH) * jacobian;
+  }else{
+    float3 H=normalize(ray+wi);
+    float NdotH=dot(normal,H);
+    float Hdotray=dot(H,ray);
+    float3 F=SchlickFresnel(F0,Hdotray);
+    float VdotH = dot(ray, H);
+    float LdotH = dot(wi, H);
+    float NdotV = dot(normal, ray);
+    float NdotL = dot(normal, wi);
+    //漫反射
+    if(mat.metallic<1.0&&mat.transparency<1.0)
     {
-        auto red_sphere = std::make_shared<Entity>(
-            "meshes/octahedron.obj",
-            Material(glm::vec3(1.0f, 0.2f, 0.2f), 0.25f, 0.0f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.7, 0.1, -0.9
-        ),
-                glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
-        );
-        scene_->AddEntity(red_sphere);
+      float FL=SchlickWeight(Ndotray);
+      float FV=SchlickWeight(Ndotwi);
+      float Fd90=0.5+2.0*mat.roughness*sqr(Hdotray);
+      float Fd=lerp(1.0,Fd90,FL)*lerp(1.0,Fd90,FV);
+      float3 diffuse=mat.base_color*(1.0-mat.metallic)*Fd/PI;
+      ret+=diffuseweight*diffuse*(1.0-F);
     }
+    diffusePDF=max(Ndotwi,0.0)/PI;
 
+    // 镜面反射
+    float ax=max(EPS,alpha/sqrt(1.0-0.9*mat.anisotropic));
+    float ay=max(EPS,alpha*sqrt(1.0-0.9*mat.anisotropic));
+    float D=GTR2_Anisotropic(NdotH,dot(H,tangent),dot(H,bitangent),ax,ay);
+    float Vis=SmithG_GGX_Correlated_Anisotropic(Ndotray,Ndotwi,dot(ray,tangent), dot(ray, bitangent), dot(wi, tangent), dot(wi, bitangent), ax, ay);
+    float3 spec=D*Vis*F; 
+    if (mat.specular_tint > EPS)
     {
-        auto green_sphere = std::make_shared<Entity>(
-            "meshes/preview_sphere.obj",
-            Material(glm::vec3(0.85f, 0.85f, 0.85f), 0.20f, 0.1f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.8, 0.4, 0.5
-                ),
-            // Material(glm::vec3(0.8f, 0.95f, 0.8f), 0.2f, 0.0f),
-                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
-        );
-        scene_->AddEntity(green_sphere);
+        float3 tint=lerp(float3(1.0, 1.0, 1.0), mat.base_color, mat.specular_tint);
+        spec*=tint;
     }
-
+    ret+=spec*specularweight;
+    float G1_V=SmithG_GGX_Anisotropic(Ndotray, dot(ray, tangent), dot(ray, bitangent), ax, ay);
+    specularPDF=(D*G1_V)/(4.0*Ndotray+EPS);
+    // 全反射
+    if(transmissionweight > EPS)
     {
-        auto blue_cube = std::make_shared<Entity>(
-            "meshes/cube.obj",
-            Material(glm::vec3(0.2f, 0.2f, 1.0f), 0.6f, 0.2f),
-            glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.5f, 0.0f))
-        );
-        scene_->AddEntity(blue_cube);
+        float eta = (!is_flip) ? 1.0/mat.ior : mat.ior;
+        float c = dot(ray, H);
+        float k = 1.0 - eta * eta * (1.0 - c * c);
+        if (k < 0.0) // 发生了全反射
+        {
+            float D_iso = GTR2(NdotH, mat.roughness);
+            float pdf_h_tir = D_iso * abs(NdotH);
+            ret+=spec*transmissionweight;
+            transmissionPDF = pdf_h_tir / (4.0 * abs(Hdotray) + EPS);
+        }
     }
 
-    scene_->BuildAccelerationStructures();
-
-    // 创建film
-    film_ = std::make_unique<Film>(core_.get(), window_->GetWidth(), window_->GetHeight());
-
-    core_->CreateBuffer(sizeof(CameraObject), grassland::graphics::BUFFER_TYPE_DYNAMIC, &camera_object_buffer_);
-    
-    core_->CreateBuffer(sizeof(HoverInfo), grassland::graphics::BUFFER_TYPE_DYNAMIC, &hover_info_buffer_);
-    HoverInfo initial_hover{};
-    initial_hover.hovered_entity_id = -1;
-    hover_info_buffer_->UploadData(&initial_hover, sizeof(HoverInfo));
-
-    // 初始化相机状态
-    camera_pos_ = glm::vec3{ 0.0f, 1.0f, 5.0f };
-    camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
-    camera_speed_ = 0.01f;
-
-    yaw_ = -90.0f;
-    pitch_ = 0.0f;
-    last_x_ = (float)window_->GetWidth() / 2.0f;
-    last_y_ = (float)window_->GetHeight() / 2.0f;
-    mouse_sensitivity_ = 0.1f;
-    first_mouse_ = true;
-
-    glm::vec3 front;
-    front.x = cos(glm::radians(yaw_)) * cos(glm::radians(pitch_));
-    front.y = sin(glm::radians(pitch_));
-    front.z = sin(glm::radians(yaw_)) * cos(glm::radians(pitch_));
-    camera_front_ = glm::normalize(front);
-
-    CameraObject camera_object{};
-    camera_object.screen_to_camera = glm::inverse(
-        glm::perspective(glm::radians(60.0f), (float)window_->GetWidth() / (float)window_->GetHeight(), 0.1f, 10.0f));
-    camera_object.camera_to_world =
-        glm::inverse(glm::lookAt(camera_pos_, camera_pos_ + camera_front_, camera_up_));
-
-    camera_object.focal_distance = focal_distance_; // add Depth field parameters
-    camera_object.aperture_size = aperture_size_;
-    camera_object.focal_length = focal_length_;
-    camera_object.lens_radius = aperture_size_ * 0.5f;
-    camera_object.enable_depth_of_field = depth_of_field_enabled_ ? 1 : 0;
-
-    camera_object_buffer_->UploadData(&camera_object, sizeof(CameraObject));
-
-    core_->CreateImage(window_->GetWidth(), window_->GetHeight(), grassland::graphics::IMAGE_FORMAT_R32G32B32A32_SFLOAT,
-        &color_image_);
-    
-    core_->CreateImage(window_->GetWidth(), window_->GetHeight(), grassland::graphics::IMAGE_FORMAT_R32_SINT,
-        &entity_id_image_);
-
-    core_->CreateShader(GetShaderCode("shaders/shader.hlsl"), "RayGenMain", "lib_6_3", &raygen_shader_);
-    core_->CreateShader(GetShaderCode("shaders/shader.hlsl"), "MissMain", "lib_6_3", &miss_shader_);
-    core_->CreateShader(GetShaderCode("shaders/shader.hlsl"), "ClosestHitMain", "lib_6_3", &closest_hit_shader_);
-    if (!raygen_shader_ || !miss_shader_ || !closest_hit_shader_) {
-        grassland::LogError("Failed to create one or more shaders");
-        alive_ = false;
-        return;
+    //光泽层
+    if (mat.sheen > EPS && mat.metallic < 1.0 && mat.transparency < 1.0)
+    {
+        float3 base=mat.base_color;
+        float lum = max(EPS, 0.2126 * base.x + 0.7152 * base.y + 0.0722 * base.z);
+        float3 tintColor = base / lum; // 提取色相（去亮度）
+        float3 sheenColor = lerp(float3(1.0,1.0,1.0), tintColor, mat.sheen_tint);
+        float w = SchlickWeight(abs(Hdotray)); // 角度权重，常用 H·V
+        float3 sheenTerm = sheenColor * (mat.sheen) * w;
+        ret += sheenweight * sheenTerm * (1.0 - F);
+        sheenPDF = diffusePDF; // 复用 cosine 采样的 PDF
     }
-    grassland::LogInfo("Shader compiled successfully");
-
-    core_->CreateRayTracingProgram(raygen_shader_.get(), miss_shader_.get(), closest_hit_shader_.get(), &program_);
-    if (!program_) {
-        grassland::LogError("Failed to create ray tracing program");
-        alive_ = false;
-        return;
+    //清漆层
+    if (mat.clearcoat > EPS && mat.transparency < 1.0)
+    {
+        float alpha_c = max(EPS, mat.clearcoat_roughness);
+        float Dc = GTR1(NdotH, alpha_c);
+        float Gc = SmithG_GGX(NdotV, alpha_c) * SmithG_GGX(NdotL, alpha_c);
+        float Fc = SchlickFresnelScalar(0.04, abs(Hdotray));
+        float coat = (Dc * Gc * Fc) / (4.0 * abs(NdotV) * abs(NdotL) + EPS);
+        ret = (1.0 - mat.clearcoat * Fc) * ret + clearcoatweight * coat;
+        clearcoatPDF = (Dc * abs(NdotH)) / (4.0 * abs(Hdotray) + EPS);
     }
-
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_ACCELERATION_STRUCTURE, 1);  // space0
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space1 - color output
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space2
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space3 - materials
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space4 - hover info
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space5 - entity ID output
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space6 - accumulated color
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space7 - accumulated samples
-
-    // 几何信息
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - geometry descriptors
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space9 - vertex infos 
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space10 - indices    
-
-    // 渲染设置
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space11 - render setting
+  }
+  pdf=diffusePDF*diffuseweight+specularPDF*specularweight+transmissionPDF*transmissionweight+sheenPDF*sheenweight+clearcoatPDF*clearcoatweight;
+  return ret;
+}
+// ====================== 阴影测试 ======================
+// void Traceray(inout RayDesc ray, inout RayPayload payload, bool for_shadow_test) {
     
-    // 光源数据
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space12 - lights buffer
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space13 - light power weights    
+//     float best_t = 1e9;
+//     payload.hit = false;
     
-    try {
-        program_->Finalize();
-        grassland::LogInfo("Ray tracing program finalized successfully");
-    } catch (const std::exception& e) {
-        grassland::LogError("Failed to finalize ray tracing program: {}", e.what());
-        alive_ = false;
-        return;
-    }    
+//     [unroll]
+//     for (int i = 0; i < MAX_MOTION_GROUPS; ++i) {
+//         RayDesc local_ray = ray;
+//         RayPayload local_payload;
+//         local_payload.hit = true;
+//         // MotionParams motion = motion_groups[i];
+
+//         // float3x3 R;
+        
+//         // if (!motion.is_static){
+//         //     float angle = length(motion.angular_velocity) * t;
+//         //     float3 axis = normalize(motion.angular_velocity);
+//         //     float c = cos(angle);
+//         //     float s = sin(angle);
+//         //     R = float3x3(  // actually inverse here
+//         //         c + axis.x*axis.x*(1-c),   axis.x*axis.y*(1-c) - axis.z*s, axis.x*axis.z*(1-c) + axis.y*s,
+//         //         axis.y*axis.x*(1-c) + axis.z*s, c + axis.y*axis.y*(1-c),   axis.y*axis.z*(1-c) - axis.x*s,
+//         //         axis.z*axis.x*(1-c) - axis.y*s, axis.z*axis.y*(1-c) + axis.x*s, c + axis.z*axis.z*(1-c)
+//         //     );
+            
+//         //     local_ray.Origin = mul(R, ray.Origin - motion.pivot_point) + motion.pivot_point - motion.linear_velocity * t;
+//         //     local_ray.Direction = mul(R, ray.Direction);
+//         // }
+
+//         if(for_shadow_test){
+//             switch (i) {
+//                 case 0: TraceRay(as, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//                 // case 1: TraceRay(as1, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//                 // case 2: TraceRay(as2, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//                 // case 3: TraceRay(as3, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//             }
+//         } else {
+//             switch (i) {
+//                 case 0: TraceRay(as, RAY_FLAG_NONE, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//                 // case 1: TraceRay(as1, RAY_FLAG_NONE, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//                 // case 2: TraceRay(as2, RAY_FLAG_NONE, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//                 // case 3: TraceRay(as3, RAY_FLAG_NONE, 0xFF, 0, 1, 0, local_ray, local_payload); break;
+//             }
+//         }
+            
+//         // if (local_payload.hit && !motion.is_static) {
+//         //     R = transpose(R);
+//         //     local_payload.hit_point = mul(R, local_payload.hit_point - motion.pivot_point) + motion.pivot_point + motion.linear_velocity * t;
+//         //     local_payload.normal = mul(R, local_payload.normal);
+//         // }
+        
+//         if (local_payload.hit) {
+//             float t_hit = length(local_payload.hit_point - ray.Origin);
+//             if (for_shadow_test) {
+//                 payload = local_payload;
+//                 return; 
+//             } else if (t_hit < best_t && t_hit > ray.TMin) {
+//                 best_t = t_hit;
+//                 payload = local_payload;
+//             }
+//         }
+//     }
+// }
+
+bool test_shadow(inout float3 hit_point, inout float3 normal, inout float3 light_dir, inout float max_distance) {
+    RayDesc shadow_ray;
+    shadow_ray.Origin = hit_point;
+    shadow_ray.Direction = light_dir;
+    shadow_ray.TMin = t_min;
+    shadow_ray.TMax = max_distance - eps * 3.0; // prevent hit the light
+    
+    RayPayload shadow_payload;
+    
+    // Traceray(shadow_ray, shadow_payload, true);
+    shadow_payload.hit = true;
+    TraceRay(as, 
+          RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | 
+          RAY_FLAG_FORCE_OPAQUE | 
+          RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+          0xFF, 0, 1, 0, shadow_ray, shadow_payload);
+    
+    return shadow_payload.hit;
 }
 
-void Application::OnClose() {
-    program_.reset();
-    raygen_shader_.reset();
-    miss_shader_.reset();
-    closest_hit_shader_.reset();
+// ====================== MIS直接光照计算 ======================
+float3 mis_direct_lighting(inout uint light_count, inout float3 hit_point, inout float3 normal, inout Material mat, 
+                           inout float3 wo, bool is_flip, inout uint seed) {
+    float3 total_light = float3(0, 0, 0);
 
-    scene_.reset();
-    film_.reset();
-    
-    light_manager_.reset();
+    if (!is_enable_lights(light_count) || mat.metallic > 0.9) return total_light;
 
-    color_image_.reset();
-    entity_id_image_.reset();
-    camera_object_buffer_.reset();
-    hover_info_buffer_.reset();
-    
-    window_.reset();
-}
+    uint sample_times = min(4, light_count);
 
-void Application::UpdateHoveredEntity() {
-    if (camera_enabled_) {
-        hovered_entity_id_ = -1;
-        hovered_pixel_color_ = glm::vec4(0.0f);
-        return;
-    }
-
-    int x = static_cast<int>(mouse_x_);
-    int y = static_cast<int>(mouse_y_);
-    int width = window_->GetWidth();
-    int height = window_->GetHeight();
-    
-    if (x < 0 || x >= width || y < 0 || y >= height) {
-        hovered_entity_id_ = -1;
-        hovered_pixel_color_ = glm::vec4(0.0f);
-        return;
-    }
-
-    grassland::graphics::Offset2D offset{ x, y };
-    grassland::graphics::Extent2D extent{ 1, 1 };
-    
-    int32_t entity_id = -1;
-    entity_id_image_->DownloadData(&entity_id, offset, extent);
-    hovered_entity_id_ = entity_id;
-    
-    float accumulated_rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    film_->GetAccumulatedColorImage()->DownloadData(accumulated_rgba, offset, extent);
-    
-    int sample_count = film_->GetSampleCount();
-    if (sample_count > 0) {
-        hovered_pixel_color_ = glm::vec4(
-            accumulated_rgba[0] / static_cast<float>(sample_count),
-            accumulated_rgba[1] / static_cast<float>(sample_count),
-            accumulated_rgba[2] / static_cast<float>(sample_count),
-            accumulated_rgba[3] / static_cast<float>(sample_count)
-        );
-    } else {
-        hovered_pixel_color_ = glm::vec4(0.0f);
-    }
-}
-
-void Application::OnUpdate() {
-    if (window_->ShouldClose()) {
-        window_->CloseWindow();
-        alive_ = false;
-        return;
-    }
-    if (alive_) {
-        ProcessInput();
+    for (int i = 0; i < sample_times; ++i) {
+        // 按功率重要性采样光源
+        int light_idx = sample_light_by_power(light_count, seed);
+        if (light_idx < 0) continue;
         
-        if (!camera_enabled_) {
-            frame_count_++;
-            if( (frame_count_ & 7) == 0)
-                grassland::LogInfo("Processing frame {}",frame_count_);
-        } else {
-            frame_count_ = 0;
+        Light light = lights[light_idx];
+        LightSample light_sample;
 
-            wheel_accumulator_ = 0.0;
-            wheel_processed_ = true;
-        }
-
-        RenderSettings settings{};
-        settings.frame_count = frame_count_;
-        settings.samples_per_pixel = samples_per_pixel_;
-        settings.max_depth = 8;
-        settings.enable_accumulation = !camera_enabled_;
-        
-        render_settings_buffer_->UploadData(&settings, sizeof(RenderSettings));
-
-        if (camera_enabled_ != last_camera_enabled_) {
-            if (camera_enabled_) {
-                grassland::LogInfo("Camera enabled - accumulation will reset when camera stops");
-            } else {
-                film_->Reset();
-                grassland::LogInfo("Camera disabled - starting accumulation");
-            }
-            last_camera_enabled_ = camera_enabled_;
-        }
-        
-        UpdateHoveredEntity();
-        
-        HoverInfo hover_info{};
-        hover_info.hovered_entity_id = hovered_entity_id_;
-        hover_info_buffer_->UploadData(&hover_info, sizeof(HoverInfo));
-
-        
-        CameraObject camera_object{};
-        camera_object.screen_to_camera = glm::inverse(
-            glm::perspective(glm::radians(60.0f), (float)window_->GetWidth() / (float)window_->GetHeight(), 0.1f, 10.0f));
-        camera_object.camera_to_world =
-            glm::inverse(glm::lookAt(camera_pos_, camera_pos_ + camera_front_, camera_up_));
-        
-        camera_object.focal_distance = focal_distance_;
-        camera_object.aperture_size = aperture_size_;
-        camera_object.focal_length = focal_length_;
-        camera_object.lens_radius = aperture_size_ * 0.5f;
-        camera_object.enable_depth_of_field = (depth_of_field_enabled_ && !camera_enabled_) ? 1 : 0;
-        
-        camera_object_buffer_->UploadData(&camera_object, sizeof(CameraObject));
-    }
-}
-
-void Application::ApplyHoverHighlight(grassland::graphics::Image* image) {
-    int width = window_->GetWidth();
-    int height = window_->GetHeight();
-    size_t pixel_count = width * height;
-    
-    std::vector<float> image_data(pixel_count * 4);
-    image->DownloadData(image_data.data());
-    
-    std::vector<int32_t> entity_ids(pixel_count);
-    entity_id_image_->DownloadData(entity_ids.data());
-    
-    float highlight_factor = 0.4f;
-    for (size_t i = 0; i < pixel_count; i++) {
-        if (entity_ids[i] == hovered_entity_id_) {
-            image_data[i * 4 + 0] = image_data[i * 4 + 0] * (1.0f - highlight_factor) + 1.0f * highlight_factor;
-            image_data[i * 4 + 1] = image_data[i * 4 + 1] * (1.0f - highlight_factor) + 1.0f * highlight_factor;
-            image_data[i * 4 + 2] = image_data[i * 4 + 2] * (1.0f - highlight_factor) + 1.0f * highlight_factor;
-        }
-    }
-    
-    image->UploadData(image_data.data());
-}
-
-void Application::SaveAccumulatedOutput(const std::string& filename) {
-    int width = window_->GetWidth();
-    int height = window_->GetHeight();
-    int sample_count = film_->GetSampleCount();
-    
-    if (sample_count == 0) {
-        grassland::LogWarning("Cannot save screenshot: no samples accumulated yet");
-        return;
-    }
-    
-    std::vector<float> accumulated_colors(width * height * 4);
-    film_->GetAccumulatedColorImage()->DownloadData(accumulated_colors.data());
-    
-    std::vector<uint8_t> byte_data(width * height * 4);
-    for (size_t i = 0; i < width * height; i++) {
-        float r = accumulated_colors[i * 4 + 0] / static_cast<float>(sample_count);
-        float g = accumulated_colors[i * 4 + 1] / static_cast<float>(sample_count);
-        float b = accumulated_colors[i * 4 + 2] / static_cast<float>(sample_count);
-        float a = accumulated_colors[i * 4 + 3] / static_cast<float>(sample_count);
-        
-        byte_data[i * 4 + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, r)) * 255.0f);
-        byte_data[i * 4 + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, g)) * 255.0f);
-        byte_data[i * 4 + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, b)) * 255.0f);
-        byte_data[i * 4 + 3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, a)) * 255.0f);
-    }
-    
-    int result = stbi_write_png(filename.c_str(), width, height, 4, byte_data.data(), width * 4);
-    
-    if (result) {
-        std::filesystem::path abs_path = std::filesystem::absolute(filename);
-        grassland::LogInfo("Screenshot saved: {} ({}x{}, {} samples)", 
-                          abs_path.string(), width, height, sample_count);
-    } else {
-        grassland::LogError("Failed to save screenshot: {}", filename);
-    }
-}
-
-void Application::RenderInfoOverlay() {
-    if (camera_enabled_ || ui_hidden_) {
-        return;
-    }
-
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(350.0f, (float)window_->GetHeight()), ImGuiCond_Always);
-    
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoMove | 
-                                     ImGuiWindowFlags_NoResize | 
-                                     ImGuiWindowFlags_NoCollapse;
-    
-    if (!ImGui::Begin("Scene Information", nullptr, window_flags)) {
-        ImGui::End();
-        return;
-    }
-
-    ImGui::SeparatorText("Camera");
-    ImGui::Text("Position: (%.2f, %.2f, %.2f)", camera_pos_.x, camera_pos_.y, camera_pos_.z);
-    ImGui::Text("Direction: (%.2f, %.2f, %.2f)", camera_front_.x, camera_front_.y, camera_front_.z);
-    ImGui::Text("Yaw: %.1f°  Pitch: %.1f°", yaw_, pitch_);
-    ImGui::Text("Speed: %.3f", camera_speed_);
-    ImGui::Text("Sensitivity: %.2f", mouse_sensitivity_);
-
-    ImGui::Spacing();
-    
-    // start of modification to Gui
-    ImGui::SeparatorText("Depth of Field");
-    
-    if (ImGui::Button(depth_of_field_ui_open_ ? "Hide DOF Settings" : "Show DOF Settings")) {
-        depth_of_field_ui_open_ = !depth_of_field_ui_open_;
-        // 当打开UI时，同步实际参数到临时参数
-        if (depth_of_field_ui_open_) {
-            temp_focal_distance_ = focal_distance_;
-            temp_aperture_size_ = aperture_size_;
-            temp_focal_length_ = focal_length_;
-        }
-    }
-    
-    if (depth_of_field_ui_open_) {
-        ImGui::Indent();
-        
-        // 启用/禁用景深
-        bool dof_enabled = depth_of_field_enabled_;
-        if (ImGui::Checkbox("Enable Depth of Field", &dof_enabled)) {
-            depth_of_field_enabled_ = dof_enabled;
-            if (!camera_enabled_) {
-                film_->Reset();
-                frame_count_ = 0;
-            }
-        }
-        
-        if (depth_of_field_enabled_) {
-            // 显示当前实际参数
-            ImGui::Text("Current Values:");
-            glm::vec3 focus_point = camera_pos_ + camera_front_ * focal_distance_;
-            ImGui::Text("  Focus: %.2fm", focal_distance_);
-            ImGui::Text("  Aperture: %.3fm (f/%.1f)", 
-                       aperture_size_, focal_length_ / aperture_size_);
-            ImGui::Text("  Focal Length: %.0fmm", focal_length_ * 1000.0f);
-            
-            ImGui::Spacing();
-            ImGui::SeparatorText("New Values");
-            
-            // 焦点距离输入框 - 移除ImGuiInputTextFlags_EnterReturnsTrue
-            ImGui::Text("Focus Dis (m):");
-            ImGui::SameLine();
-            ImGui::PushItemWidth(120.0f);
-            // 只更新临时变量，不触发任何操作
-            ImGui::InputFloat("##temp_focal_distance", &temp_focal_distance_, 0.0f, 0.0f, "%.2f");
-            ImGui::PopItemWidth();
-            
-            // 显示范围提示
-            ImGui::SameLine();
-            ImGui::TextDisabled("[0.05, 500.0]");
-            
-            // 光圈大小输入框
-            ImGui::Text("Aperture Size (m):");
-            ImGui::SameLine();
-            ImGui::PushItemWidth(120.0f);
-            ImGui::InputFloat("##temp_aperture_size", &temp_aperture_size_, 0.0f, 0.0f, "%.3f");
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            float temp_f_stop = focal_length_ / aperture_size_;
-            ImGui::TextDisabled("(f/%.1f)", temp_f_stop);
-            
-            // 焦距输入框
-            ImGui::Text("Focal Length (mm):");
-            ImGui::SameLine();
-            ImGui::PushItemWidth(120.0f);
-            float temp_focal_length_mm = temp_focal_length_ * 1000.0f;
-            if (ImGui::InputFloat("##temp_focal_length", &temp_focal_length_mm, 0.0f, 0.0f, "%.0f")) {
-                temp_focal_length_ = temp_focal_length_mm / 1000.0f;
-            }
-            ImGui::PopItemWidth();
-            
-            // 显示视角信息
-            float sensor_width = 0.036f;
-            float fov = 2.0f * atan(sensor_width / (2.0f * temp_focal_length_));
-            ImGui::SameLine();
-            ImGui::TextDisabled("%.1f°", glm::degrees(fov));
-            
-            // 参数验证
-            bool params_valid = true;
-            std::string error_msg;
-            
-            if (temp_focal_distance_ < 0.05f || temp_focal_distance_ > 500.0f) {
-                params_valid = false;
-                error_msg = "Focus distance must be between 0.05 and 500.0m";
-            } else if (temp_aperture_size_ < 0.001f || temp_aperture_size_ > 5f) {
-                params_valid = false;
-                error_msg = "Aperture must be between 0.001 and 5m";
-            } else if (temp_focal_length_ < 0.01f || temp_focal_length_ > 2f) {
-                params_valid = false;
-                error_msg = "Focal length must be between 10 and 2000mm";
-            }
-            
-            // 显示错误信息
-            if (!params_valid) {
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "%s", error_msg.c_str());
-            }
-            
-            // Set按钮
-            ImGui::Spacing();
-            ImGui::BeginGroup();
-            
-            // 禁用无效参数的Set按钮
-            ImGui::BeginDisabled(!params_valid);
-            
-            if (ImGui::Button("Set", ImVec2(80, 30))) {
-                ApplyDepthOfFieldParams();
-            }
-            
-            ImGui::EndDisabled();
-            
-            ImGui::SameLine();
-            
-            // Reset按钮 - 重置为当前实际值
-            if (ImGui::Button("Reset", ImVec2(80, 30))) {
-                temp_focal_distance_ = focal_distance_;
-                temp_aperture_size_ = aperture_size_;
-                temp_focal_length_ = focal_length_;
-            }
-            
-            ImGui::SameLine();
-            
-            // Default按钮
-            if (ImGui::Button("Default", ImVec2(80, 30))) {
-                temp_focal_distance_ = 5.0f;
-                temp_aperture_size_ = 0.1f;
-                temp_focal_length_ = 0.035f;
-            }
-            
-            ImGui::EndGroup();
-            
-            // 滚轮控制提示
-            ImGui::Spacing();
-            ImGui::SeparatorText("Controls");
-            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Mouse Wheel: Adjust focus distance in real-time");
-            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "F Key: Toggle Depth of Field");
-            ImGui::Text("Input boxes require 'Set' button to apply changes");
-        }
-        
-        ImGui::Unindent();
-    }
-
-    // end of modification
-
-    ImGui::SeparatorText("Scene");
-    size_t entity_count = scene_->GetEntityCount();
-    ImGui::Text("Entities: %zu", entity_count);
-    ImGui::Text("Materials: %zu", entity_count);
-    
-    if (light_manager_) {
-        size_t light_count = light_manager_->GetLightCount();
-        int enabled_lights = light_manager_->GetEnabledLightCount();
-        ImGui::Text("Lights: %zu (Enabled: %d)", light_count, enabled_lights);
-    }
-    
-    if (hovered_entity_id_ >= 0) {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Hovered: Entity #%d", hovered_entity_id_);
-    } else {
-        ImGui::Text("Hovered: None");
-    }
-    
-    if (selected_entity_id_ >= 0) {
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Selected: Entity #%d", selected_entity_id_);
-    } else {
-        ImGui::Text("Selected: None");
-    }
-    
-    ImGui::Spacing();
-    
-    ImGui::SeparatorText("Pixel Inspector");
-    ImGui::Text("Mouse Position: (%d, %d)", (int)mouse_x_, (int)mouse_y_);
-    
-    ImGui::Text("Pixel Color:");
-    ImGui::SameLine();
-    ImGui::ColorButton("##pixel_color_preview", 
-                       ImVec4(hovered_pixel_color_.r, hovered_pixel_color_.g, hovered_pixel_color_.b, 1.0f),
-                       ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoBorder,
-                       ImVec2(40, 20));
-    
-    ImGui::Text("  R: %.3f", hovered_pixel_color_.r);
-    ImGui::Text("  G: %.3f", hovered_pixel_color_.g);
-    ImGui::Text("  B: %.3f", hovered_pixel_color_.b);
-    
-    ImGui::Text("  RGB (8-bit): (%d, %d, %d)", 
-                (int)(hovered_pixel_color_.r * 255.0f),
-                (int)(hovered_pixel_color_.g * 255.0f),
-                (int)(hovered_pixel_color_.b * 255.0f));
-    
-    size_t total_triangles = 0;
-    for (const auto& entity : scene_->GetEntities()) {
-        if (entity && entity->GetIndexBuffer()) {
-            size_t indices = entity->GetIndexBuffer()->Size() / sizeof(uint32_t);
-            total_triangles += indices / 3;
-        }
-    }
-    ImGui::Text("Total Triangles: %zu", total_triangles);
-
-    ImGui::Spacing();
-
-    ImGui::SeparatorText("Render");
-    ImGui::Text("Resolution: %d x %d", window_->GetWidth(), window_->GetHeight());
-    ImGui::Text("Backend: %s", 
-                core_->API() == grassland::graphics::BACKEND_API_VULKAN ? "Vulkan" : "D3D12");
-    ImGui::Text("Device: %s", core_->DeviceName().c_str());
-    
-    ImGui::Spacing();
-    
-    ImGui::SeparatorText("Accumulation");
-    if (!camera_enabled_) {
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Status: Active");
-        ImGui::Text("Samples: %d", film_->GetSampleCount());
-    } else {
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Status: Paused");
-        ImGui::Text("(Disable camera to accumulate)");
-    }
-
-    ImGui::Spacing();
-
-    ImGui::SeparatorText("Controls");
-    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Right Click to enable camera");
-    ImGui::Text("W/A/S/D - Move camera");
-    ImGui::Text("Space/Shift - Up/Down");
-    ImGui::Text("Mouse - Look around");
-    ImGui::Spacing();
-    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.5f, 1.0f), "Hold Tab to hide UI");
-    ImGui::TextColored(ImVec4(0.5f, 1.0f, 1.0f, 1.0f), "Ctrl+S to save screenshot");
-
-    ImGui::End();
-}
-
-void Application::RenderEntityPanel() {
-    if (camera_enabled_ || ui_hidden_) {
-        return;
-    }
-
-    ImGui::SetNextWindowPos(ImVec2((float)window_->GetWidth() - 350.0f, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(350.0f, (float)window_->GetHeight()), ImGuiCond_Always);
-    
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoMove | 
-                                     ImGuiWindowFlags_NoResize | 
-                                     ImGuiWindowFlags_NoCollapse;
-    
-    if (!ImGui::Begin("Entity Inspector", nullptr, window_flags)) {
-        ImGui::End();
-        return;
-    }
-
-    ImGui::SeparatorText("Entity Selection");
-    
-    const auto& entities = scene_->GetEntities();
-    size_t entity_count = entities.size();
-    
-    ImGui::Text("Select Entity:");
-    
-    std::string preview_text = selected_entity_id_ >= 0 ? 
-        "Entity #" + std::to_string(selected_entity_id_) : 
-        "None";
-    
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::BeginCombo("##entity_select", preview_text.c_str())) {
-        bool is_selected = (selected_entity_id_ == -1);
-        if (ImGui::Selectable("None", is_selected)) {
-            selected_entity_id_ = -1;
-        }
-        if (is_selected) {
-            ImGui::SetItemDefaultFocus();
-        }
-        
-        for (size_t i = 0; i < entity_count; i++) {
-            std::string label = "Entity #" + std::to_string(i);
-            bool is_entity_selected = (selected_entity_id_ == (int)i);
-            
-            if (ImGui::Selectable(label.c_str(), is_entity_selected)) {
-                selected_entity_id_ = (int)i;
-            }
-            
-            if (is_entity_selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        
-        ImGui::EndCombo();
-    }
-    
-    ImGui::Spacing();
-    
-    if (selected_entity_id_ >= 0 && selected_entity_id_ < (int)entity_count) {
-        ImGui::SeparatorText("Entity Details");
-        
-        const auto& entity = entities[selected_entity_id_];
-        
-        ImGui::Text("Transform:");
-        glm::mat4 transform = entity->GetTransform();
-        glm::vec3 position = glm::vec3(transform[3]);
-        ImGui::Text("  Position: (%.2f, %.2f, %.2f)", position.x, position.y, position.z);
-        
-        glm::vec3 scale = glm::vec3(
-            glm::length(glm::vec3(transform[0])),
-            glm::length(glm::vec3(transform[1])),
-            glm::length(glm::vec3(transform[2]))
-        );
-        ImGui::Text("  Scale: (%.2f, %.2f, %.2f)", scale.x, scale.y, scale.z);
-        
-        ImGui::Spacing();
-        
-        ImGui::SeparatorText("Material");
-        Material mat = entity->GetMaterial();
-        
-        ImGui::Text("Base Color:");
-        ImGui::ColorEdit3("##base_color", &mat.base_color[0], ImGuiColorEditFlags_NoInputs);
-        ImGui::Text("  RGB: (%.2f, %.2f, %.2f)", mat.base_color.r, mat.base_color.g, mat.base_color.b);
-        
-        ImGui::Text("Roughness: %.2f", mat.roughness);
-        ImGui::Text("Metallic: %.2f", mat.metallic);
-        
-        ImGui::Spacing();
-        
-        ImGui::SeparatorText("Mesh");
-        if (entity->GetIndexBuffer()) {
-            size_t index_count = entity->GetIndexBuffer()->Size() / sizeof(uint32_t);
-            size_t triangle_count = index_count / 3;
-            ImGui::Text("Triangles: %zu", triangle_count);
-            ImGui::Text("Indices: %zu", index_count);
-        }
-        
-        if (entity->GetVertexInfoBuffer()) {
-            size_t vertex_size = sizeof(float) * 3;
-            size_t vertex_count = entity->GetVertexInfoBuffer()->Size() / vertex_size;
-            ImGui::Text("Vertices: %zu", vertex_count);
-        }
-        
-        ImGui::Spacing();
-        
-        ImGui::SeparatorText("Acceleration Structure");
-        if (entity->GetBLAS()) {
-            ImGui::Text("BLAS: Built");
-        } else {
-            ImGui::Text("BLAS: Not built");
-        }
-    } else {
-        ImGui::TextDisabled("No entity selected");
-        ImGui::Spacing();
-        ImGui::TextWrapped("Hover over an entity to highlight it, then left-click to select. Or use the dropdown above.");
-    }
-    
-    ImGui::End();
-}
-
-void Application::RenderLightPanel() {
-    if (camera_enabled_ || ui_hidden_ || !light_manager_) {
-        return;
-    }
-
-    ImGui::SetNextWindowPos(ImVec2(350.0f, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(350.0f, (float)window_->GetHeight() * 0.7f), ImGuiCond_Always);
-    
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoMove | 
-                                     ImGuiWindowFlags_NoResize | 
-                                     ImGuiWindowFlags_NoCollapse;
-    
-    if (!ImGui::Begin("Light Manager", nullptr, window_flags)) {
-        ImGui::End();
-        return;
-    }
-
-    ImGui::SeparatorText("Light Configuration");
-    
-    auto& lights = light_manager_->GetLights();
-    size_t light_count = lights.size();
-    
-    for (size_t i = 0; i < light_count; i++) {
-        Light& light = lights[i];
-        
-        std::string light_label = "Light " + std::to_string(i);
-        std::string type_str;
         switch (light.type) {
-            case 0: type_str = "Point Light"; break;
-            case 1: type_str = "Area Light"; break;
-            case 2: type_str = "Directional Light"; break;
-            default: type_str = "Unknown"; break;
+            case 0: sample_point_light(light, hit_point, seed, light_sample); break;
+            case 1: sample_area_light(light, hit_point, seed, light_sample); break;
+            case 2: sample_spot_light(light, hit_point, seed, light_sample); break;
+            case 3: sample_sphere_light(light, hit_point, seed, light_sample); break;
+        }
+
+        if (!light_sample.valid){
+          continue;
+        }
+
+        // 阴影测试
+        float light_distance = length(light_sample.position - hit_point);
+        if (test_shadow(hit_point, normal, light_sample.direction, light_distance)) {
+            continue;
         }
         
-        if (ImGui::TreeNode((light_label + " - " + type_str).c_str())) {
-            // Enabled toggle
-            bool enabled = light.enabled;
-            ImGui::Checkbox("Enabled", &enabled);
+        // 计算 BRDF 贡献
+        float3 wi = light_sample.direction;
+        float ndotl = max(EPS, abs(dot(normal, wi)));
+        float pdf;
+        float3 bsdf_val = EvalBSDF(mat, wo, wi, normal, is_flip, pdf);
+        // bsdf_val = max( min(bsdf_val, 50.0 * float3(1 / (ndotl + EPS), 1 / (ndotl + EPS), 1 / (ndotl + EPS))), float3(0.0, 0.0, 0.0));
+        // pdf = max(pdf, 0.0);
+
+        float3 light_contrib = light_sample.radiance * bsdf_val * ndotl;
+        
+        if (any(light_contrib > 0.0)) {
+            // 计算光源采样PDF
+            float light_select_pdf = light_power_weights[light_idx];
+            float light_pdf = light_sample.pdf * light_select_pdf;
             
-            // Light type selector
-            const char* light_types[] = { "Point Light", "Area Light", "Directional Light" };
-            ImGui::Combo("Type", &light.type, light_types, 3);
-            
-            // Position (for point and area lights)
-            if (light.type != 2) { // Not directional light
-                ImGui::DragFloat3("Position", &light.position[0], 0.1f);
-            } else {
-                // Directional light has position for reference
-                ImGui::DragFloat3("Reference Position", &light.position[0], 0.1f);
+            if (light.type == 0 || light.type == 2) {
+                // 点光源和聚光灯：直接加（delta光源）
+                total_light += light_contrib / light_pdf;
             }
-            
-            // Direction (for area and directional lights)
-            if (light.type != 0) { // Not point light
-                ImGui::DragFloat3("Direction", &light.direction[0], 0.01f, -1.0f, 1.0f);
-                
-                if (light.type == 1) { // Area light
-                    ImGui::DragFloat2("Size", &light.size[0], 0.1f, 0.1f, 10.0f);
-                }
-                
-                if (light.type == 2) { // Directional light
-                    ImGui::DragFloat("Cone Angle", &light.cone_angle, 0.5f, 0.0f, 180.0f);
-                }
+            else {
+                // 面光源和球光源：使用MIS
+                float mis_weight = mis_balance_weight(light_pdf, pdf);
+                total_light += light_contrib * mis_weight / light_pdf;
             }
-            
-            // Color and intensity
-            ImGui::ColorEdit3("Color", &light.color[0]);
-            ImGui::DragFloat("Intensity", &light.intensity, 0.1f, 0.0f, 10.0f);
-            
-            ImGui::TreePop();
         }
     }
-    
-    // Add light button
-    if (ImGui::Button("Add Light")) {
-        Light new_light = Light::CreatePointLight(glm::vec3(0.0f, 3.0f, 0.0f), glm::vec3(1.0f), 1.0f);
-        light_manager_->AddLight(new_light);
-    }
-    
-    // Update buffers button
-    if (ImGui::Button("Update Light Buffers")) {
-        light_manager_->UpdateBuffers();
-    }
-    
-    ImGui::End();
+    return total_light / sample_times;
 }
 
-void Application::OnRender() {
-    if (!alive_) {
-        return;
+float IntersectRaySphere(inout RayDesc ray, inout float3 sphere_center, float sphere_radius) {
+    float3 oc = ray.Origin - sphere_center;
+    float a = dot(ray.Direction, ray.Direction);
+    float b = dot(oc, ray.Direction);
+    float c = dot(oc, oc) - sphere_radius * sphere_radius;
+    
+    float delta = b * b - a * c;  // divide 2
+    
+    if (delta < 0.0) {
+        return -1.0;
     }
 
-    std::unique_ptr<grassland::graphics::CommandContext> command_context;
-    core_->CreateCommandContext(&command_context);
-    command_context->CmdClearImage(color_image_.get(), { {0.6, 0.7, 0.8, 1.0} });
+    delta = sqrt(delta);
+    float t = (-b - delta) / a;
     
-    command_context->CmdClearImage(entity_id_image_.get(), { {-1, 0, 0, 0} });
-    
-    command_context->CmdBindRayTracingProgram(program_.get());
-    command_context->CmdBindResources(0, scene_->GetTLAS(), grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(1, { color_image_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(2, { camera_object_buffer_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(3, { scene_->GetMaterialsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(4, { hover_info_buffer_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(5, { entity_id_image_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(6, { film_->GetAccumulatedColorImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(7, { film_->GetAccumulatedSamplesImage() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    
-    // Geometry data
-    command_context->CmdBindResources(8, { scene_->GetGeometryDescriptorsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(9, { scene_->GetVertexInfoBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(10, { scene_->GetIndexBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
+    if (t < ray.TMin) {
+        t = (-b + delta) / a;
+    }
 
-    // Render settings
-    command_context->CmdBindResources(11, { render_settings_buffer_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
+    return (t >= ray.TMin && t <= ray.TMax) ? t : -1.0;
     
-    // Light data
-    command_context->CmdBindResources(12, { light_manager_->GetLightsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
-    command_context->CmdBindResources(13, { light_manager_->GetPowerWeightsBuffer() }, grassland::graphics::BIND_POINT_RAYTRACING);
+}
+
+void CheckHitSphereLight(inout uint light_count, inout RayDesc ray, inout RayPayload payload, inout uint closest_light_idx) {
+    float closest_distance = ray.TMax;
+    closest_light_idx = 0xFFFFFFFF;
     
-    command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
-    
-    grassland::graphics::Image* display_image = color_image_.get();
-    if (!camera_enabled_) {
-        film_->IncrementSampleCount();
-        film_->DevelopToOutput();
-        display_image = film_->GetOutputImage();
+    if (payload.hit) {
+        closest_distance = length(payload.hit_point - ray.Origin);
     }
     
-    if (hovered_entity_id_ >= 0 && !camera_enabled_) {
-        ApplyHoverHighlight(display_image);
+    for (int i = 0; i < light_count; ++i) {
+        Light light = lights[i];
+        
+        if (light.type != 3 || !light.visible || !light.enabled) {
+            continue;
+        }
+        
+        float t = IntersectRaySphere(ray, light.position, light.radius);
+        
+        if (t > 0.0 && t < closest_distance) {
+            closest_distance = t;
+            closest_light_idx = i;
+            
+            payload.hit = true;
+            payload.hit_point = ray.Origin + t * ray.Direction;
+        }
+    }
+}
+// ====================== 景深辅助函数 ====================
+
+float2 concentric_sample_disk(inout uint seed) {
+    float2 u = random2(seed) * 2.0 - 1.0;
+    
+    if (u.x == 0.0 && u.y == 0.0) {
+        return float2(0.0, 0.0);
     }
     
-    window_->BeginImGuiFrame();
-    RenderInfoOverlay();
-    RenderEntityPanel();
-    RenderLightPanel();
-    window_->EndImGuiFrame();
+    float theta, r;
+    if (abs(u.x) > abs(u.y)) {
+        r = u.x;
+        theta = (PI / 4.0) * (u.y / u.x);
+    } else {
+        r = u.y;
+        theta = (PI / 2.0) - (PI / 4.0) * (u.x / u.y);
+    }
     
-    command_context->CmdPresent(window_.get(), display_image);
-    core_->SubmitCommandContext(command_context.get());
+    return r * float2(cos(theta), sin(theta));
+}
+
+float3 compute_focal_point(float3 ray_origin, float3 ray_dir, float focal_distance) {
+    // 计算光线与焦平面的交点
+    // 假设焦平面垂直于相机前向方向
+    float3 camera_forward = float3(0.0, 0.0, -1.0); // 相机空间前向
+    float3 world_forward = mul((float3x3)camera_info.camera_to_world, camera_forward);
+    world_forward = normalize(world_forward);
+    
+    // 焦平面方程: dot(p - (origin + world_forward * focal_distance), world_forward) = 0
+    float3 focal_plane_origin = ray_origin + world_forward * focal_distance;
+    float denom = dot(ray_dir, world_forward);
+    
+    if (abs(denom) > 1e-6) {
+        float t = dot(focal_plane_origin - ray_origin, world_forward) / denom;
+        return ray_origin + ray_dir * t;
+    }
+    
+    // 平行于焦平面，使用近似值
+    return ray_origin + ray_dir * focal_distance;
+}
+
+// ====================== 主渲染逻辑 ======================
+[shader("raygeneration")]
+void RayGenMain() {
+    uint2 pixel_coords = DispatchRaysIndex().xy;
+    uint seed = generate_seed(pixel_coords, render_setting.frame_count);
+
+    // 生成相机射线（相机空间）
+    float2 pixel_center = (float2)DispatchRaysIndex() + 
+                         (render_setting.enable_accumulation ? random2(seed) : float2(0.5, 0.5));
+    float2 uv = pixel_center / float2(DispatchRaysDimensions().xy);
+    uv.y = 1.0 - uv.y;
+    
+    float2 d = uv * 2.0 - 1.0;
+    
+    float4 target_camera = mul(camera_info.screen_to_camera, float4(d, 1, 1));
+    float3 ray_dir_camera = normalize(target_camera.xyz);
+    float3 ray_origin_camera = float3(0, 0, 0); 
+    
+    // 景深效果：薄透镜相机模型
+    if (camera_info.enable_depth_of_field && camera_info.lens_radius > 0.0) {
+        
+        float3 focal_point_camera = ray_dir_camera * (camera_info.focal_distance / max(-ray_dir_camera.z, EPS));
+        float2 lens_sample = concentric_sample_disk(seed) * camera_info.lens_radius;
+        
+        ray_origin_camera = float3(lens_sample.x, lens_sample.y, 0.0f);
+        ray_dir_camera = normalize(focal_point_camera - ray_origin_camera);
+    }
+
+    float time_offset = 0.0;
+    if (camera_info.enable_motion_blur) {
+        time_offset = random(seed) * camera_info.exposure_time;
+    }
+    
+    float angular_offset = camera_info.camera_angular_velocity * time_offset;
+    
+    float cos_theta = cos(angular_offset);
+    float sin_theta = sin(angular_offset);
+    float3x3 rotation_matrix = float3x3(
+        cos_theta, -sin_theta, 0.0,
+        sin_theta,  cos_theta, 0.0,
+        0.0,       0.0,       1.0
+    );
+
+    ray_origin_camera = mul(rotation_matrix, ray_origin_camera);
+    ray_dir_camera = mul(rotation_matrix, ray_dir_camera);
+
+    float4 origin = mul(camera_info.camera_to_world, float4(ray_origin_camera, 1.0));
+    float4 direction = mul(camera_info.camera_to_world, float4(ray_dir_camera, 0.0));
+    origin.xyz += camera_info.camera_linear_velocity * time_offset;
+    
+    float3 color = float3(0.0, 0.0, 0.0);
+    float3 throughput = float3(1.0, 1.0, 1.0);
+    RayDesc ray;
+    ray.Origin = origin.xyz;
+    ray.Direction = normalize(direction.xyz);
+    ray.TMin = t_min;
+    ray.TMax = t_max;
+
+    entity_id_output[pixel_coords] = -1;
+
+    float3 prev_hit_point, prev_normal;
+    float prev_bsdf_pdf;
+    bool prev_is_specular = false;
+
+    uint light_count, light_idx;
+    lights.GetDimensions(light_count, light_idx);
+
+    for (int depth = 0; depth < min(render_setting.max_depth, MAX_DEPTH); ++depth) {
+
+        RayPayload payload;
+        
+        TraceRay(as, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
+        // Traceray(ray, payload, 0);
+
+        CheckHitSphereLight(light_count, ray, payload, light_idx);
+
+        Material mat;
+
+        if(light_idx == 0xFFFFFFFF){
+            if (!payload.hit) {
+                // 天空盒
+                color += payload.color * throughput;
+                break;
+            }
+            
+            // 记录首次命中的实体ID
+            if (depth == 0) {
+                entity_id_output[pixel_coords] = (int)payload.instance_id;
+            }
+
+            mat = materials[payload.instance_id];
+            light_idx = mat.light_index;
+        }
+
+        float3 wo = -ray.Direction;
+        
+        // 处理光源命中
+        if (light_idx != 0xFFFFFFFF) {
+            Light light = lights[light_idx];
+
+            if(light.type != 1 || dot(wo, light.direction) > 0){
+
+                if (depth == 0 || prev_is_specular) {
+                    // 第一次直接击中光源或镜面反射击中光源
+                    if (light.enabled) {
+                        color += light.color * light.intensity * throughput;
+                    }
+                } else {
+                    // BSDF采样击中光源，需要MIS
+                    if (!light.enabled || (light.type != 1 && light.type != 3)) {
+                        break;
+                    }
+                    
+                    float3 to_light = payload.hit_point - prev_hit_point;
+                    float distance = length(to_light);
+                    float3 light_dir = to_light / distance;
+                    
+                    // 计算光源采样PDF
+                    float light_pdf = 0.0;
+                    float cos_theta_l = max(EPS, abs(dot(light_dir, prev_normal)));
+                    
+                    if (light.type == 1) { // 面光源
+                        float area = light.size.x * light.size.y;
+                        light_pdf = (distance * distance) / (cos_theta_l * area);
+                    } else if (light.type == 3) { // 球光源
+                        float surface_area = 4.0 * PI * light.radius * light.radius;
+                        light_pdf = (distance * distance) / (cos_theta_l * surface_area);
+                    }
+                    
+                    float light_select_pdf = light_power_weights[light_idx];
+                    light_pdf *= light_select_pdf;
+
+                    // 计算MIS权重
+                    float mis_weight = mis_balance_weight(prev_bsdf_pdf, light_pdf);
+                    
+                    // 应用MIS
+                    color += light.color * light.intensity * throughput * mis_weight; // Here throughut equals to pre_throughput * prev_eval_brdf / prev_bsdf_pdf
+                }
+                break;
+            }
+        }
+
+        prev_hit_point = payload.hit_point;
+
+        // MIS直接光照
+        float3 direct_light = mis_direct_lighting(light_count, payload.hit_point, payload.normal, mat, wo, payload.is_filp, seed);
+        color += direct_light * throughput;
+        
+        // 处理自发光材质
+        if (any(mat.emission > 0.0)) {
+            color += mat.emission * throughput;
+        }
+        
+        // 俄罗斯轮盘赌终止
+        if (depth > 4) {
+            float p_survive = min(f3_max(throughput), RR_THRESHOLD);
+            if (random(seed) > p_survive) break;
+            throughput /= p_survive;
+        }
+        
+        // 采样下一跳方向（BSDF采样）
+        float3 wi = float3(0.0, 0.0, 0.0);
+        if(!SampleBSDF(mat, wo, payload.normal, wi, payload.is_filp, seed)){
+            break;
+        }
+        //wi = SampleHemisphereCos(random2(seed),payload.normal);
+
+        float pdf;
+        float3 bsdf_val = EvalBSDF(mat, wo, wi, payload.normal, payload.is_filp, pdf);
+
+        if (pdf <= 1e-7) {
+            break;
+        }
+        if(isinf(pdf) || isnan(pdf)){
+          color = float3(1e9, 0.0, isnan(pdf)? 1e9: 0);
+          break;
+        }
+
+        prev_normal = payload.normal;
+        
+        // 计算余弦项
+        float cos_theta = dot(payload.normal, wi);
+        if (cos_theta <= 0.0) {
+            payload.normal = - payload.normal;
+            cos_theta = - cos_theta;
+        }
+
+        
+        // 更新吞吐量
+        throughput *= bsdf_val * cos_theta / pdf;
+        // throughput = max(throughput, float3(0.0, 0.0, 0.0));
+
+        
+        // 记录用于MIS的数据
+        prev_bsdf_pdf = pdf;
+        
+        prev_is_specular = (mat.metallic > 0.9 || mat.clearcoat > 0.0); // simplified
+        
+        // 准备下一次光线
+        ray.Origin = payload.hit_point + payload.normal * eps;
+        ray.Direction = normalize(wi);
+        ray.TMin = t_min;
+        ray.TMax = t_max;
+    }
+
+    // color = max(color, float3(0.0, 0.0, 0.0));
+    
+    // 输出和累积
+    output[pixel_coords] = float4(color, 1);
+    
+    if (render_setting.enable_accumulation) {
+        float4 prev_color = accumulated_color[pixel_coords];
+        int prev_samples = accumulated_samples[pixel_coords];
+        accumulated_color[pixel_coords] = prev_color + float4(color, 1);
+        accumulated_samples[pixel_coords] = prev_samples + 1;
+    }
+}
+
+// // ====================== 命中着色器 ======================
+[shader("miss")]
+void MissMain(inout RayPayload payload) {
+    // 简化的天空渐变
+    float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);
+    payload.color = lerp(float3(1.0, 1.0, 1.0), float3(0.5, 0.7, 1.0), t) * 0.25;
+    payload.hit = false;
+    payload.instance_id = 0xFFFFFFFF;
+}
+
+[shader("closesthit")]
+void ClosestHitMain(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {
+    payload.hit = true;
+    payload.instance_id = InstanceID();
+    uint primitive_id = PrimitiveIndex();
+    
+    // 获取几何数据
+    GeometryDescriptor geo_desc = geometry_descriptors[payload.instance_id];
+    
+    // 计算世界空间命中点
+    float3 ray_origin = WorldRayOrigin();
+    float3 ray_direction = WorldRayDirection();
+    float hit_distance = RayTCurrent();
+    payload.hit_point = ray_origin + hit_distance * ray_direction;
+    
+    // 获取三角形顶点
+    uint index_offset = geo_desc.index_offset + primitive_id * 3;
+    uint i0 = indices[index_offset];
+    uint i1 = indices[index_offset + 1];
+    uint i2 = indices[index_offset + 2];
+    
+    VertexInfo v0 = vertices[geo_desc.vertex_offset + i0];
+    VertexInfo v1 = vertices[geo_desc.vertex_offset + i1];
+    VertexInfo v2 = vertices[geo_desc.vertex_offset + i2];
+    
+    // 计算法线
+    float3 object_space_normal;
+    if (length(v0.normal) < 1e-6) {
+        // 使用几何法线
+        object_space_normal = cross(v1.position - v0.position, v2.position - v0.position);
+    } else {
+        // 插值顶点法线
+        float w0 = attr.barycentrics.x;
+        float w1 = attr.barycentrics.y;
+        object_space_normal = w0 * v1.normal + w1 * v2.normal + (1.0 - w0 - w1) * v0.normal;
+    }
+    
+    object_space_normal = normalize(object_space_normal);
+    
+    // 转换到世界空间
+    float3x3 normal_matrix = (float3x3)transpose(WorldToObject4x3());
+    payload.normal = normalize(mul(normal_matrix, object_space_normal));
+    
+    // 确保法线朝向射线方向
+    payload.is_filp = false;
+    if (dot(payload.normal, ray_direction) > 0) {
+        payload.normal = -payload.normal;
+        payload.is_filp = true;
+    }
 }

@@ -1,14 +1,17 @@
 #include "Entity.h"
 #include "Geometry.h"
+#include "Motion.h"
 
 #define ENABLE_NORMAL_INTERPOLATION 1
 #define CALCULATE_MISSING_NORMALS 0
 
 Entity::Entity(const std::string& obj_file_path, 
                const Material& material,
-               const glm::mat4& transform)
+               const glm::mat4& transform,
+               const MotionParams& motion)
     : material_(material)
     , transform_(transform)
+    , motion_params_(motion)  // 初始化运动参数
     , mesh_loaded_(false) {
     
     LoadMesh(obj_file_path);
@@ -50,11 +53,12 @@ void Entity::BuildBLAS(grassland::graphics::Core* core) {
 
     const glm::vec3* positions = reinterpret_cast<const glm::vec3*>(mesh_.Positions());
     const glm::vec3* normals = reinterpret_cast<const glm::vec3*>(mesh_.Normals());
+    const glm::vec2* texcoords = reinterpret_cast<const glm::vec2*>(mesh_.TexCoords());
 
     if (ENABLE_NORMAL_INTERPOLATION && normals) {
         grassland::LogInfo("Use provided normals in the mesh.");
         for (size_t i = 0; i < mesh_.NumVertices(); ++i) {
-            vertex_infos.emplace_back(positions[i], normals[i]);
+            vertex_infos.emplace_back(positions[i], normals[i], texcoords[i]);
         }
     } 
     else if(ENABLE_NORMAL_INTERPOLATION && CALCULATE_MISSING_NORMALS){
@@ -89,7 +93,7 @@ void Entity::BuildBLAS(grassland::graphics::Core* core) {
         }
 
         for (size_t i = 0; i < mesh_.NumVertices(); ++i) {
-            vertex_infos.emplace_back(positions[i], accumulated_normals[i]);
+            vertex_infos.emplace_back(positions[i], accumulated_normals[i], texcoords[i]);
         }
         grassland::LogInfo("Calculated {} average normals for the mesh.", mesh_.NumVertices());
 
@@ -97,7 +101,7 @@ void Entity::BuildBLAS(grassland::graphics::Core* core) {
 
         grassland::LogWarning("Mesh has no normals! Results may be incorrect");
         for (size_t i = 0; i < mesh_.NumVertices(); ++i) {
-            vertex_infos.emplace_back(positions[i], glm::vec3(0.0f, 0.0f, 0.0f));
+            vertex_infos.emplace_back(positions[i], glm::vec3(0.0f, 0.0f, 0.0f), texcoords[i]);
         }
     }
 

@@ -111,6 +111,9 @@ struct MotionParams {
     int group_id; 
 };
 StructuredBuffer<MotionParams> motion_groups : register(t0, space14);
+Texture2D<float4> g_Textures[128] : register(t0, space18);
+SamplerState g_Sampler : register(s0, space18);
+
 
 
 struct RayPayload {
@@ -595,7 +598,6 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
   specularweight/=total;
   transmissionweight/=total;
   sheenweight/=total;
-  clearcoatweight/=total;
   if(is_trans)//透射
   {
     float n1 = is_flip ? mat.ior : 1.0; // V 侧 (Camera 侧)
