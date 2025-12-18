@@ -229,27 +229,27 @@ void LightManager::CreateDefaultLights() {
     lights_.clear();
     light_entities_.clear();
     
-    //创建一个可见的面光源作为示例
-    Light visible_area_light = Light::CreateAreaLight(
-        glm::vec3(0.0f, 3.0f, 0.0f),      // 位置
-        glm::vec3(0.0f, -1.0f, 0.0f),     // 法线方向（向下）
-        glm::vec3(1.0f, 0.0f, 0.0f),      // 切向量（指向X轴）
-        glm::vec2(2.0f, 2.0f),            // 尺寸
-        glm::vec3(1.0f, 1.0f, 0.9f),      // 暖白色
-        1.0f,                             // 强度
-        true                              // 可见
-    );
-    lights_.push_back(visible_area_light);
+    // //创建一个可见的面光源作为示例
+    // Light visible_area_light = Light::CreateAreaLight(
+    //     glm::vec3(0.0f, 3.0f, 0.0f),      // 位置
+    //     glm::vec3(0.0f, -1.0f, 0.0f),     // 法线方向（向下）
+    //     glm::vec3(1.0f, 0.0f, 0.0f),      // 切向量（指向X轴）
+    //     glm::vec2(2.0f, 2.0f),            // 尺寸
+    //     glm::vec3(1.0f, 1.0f, 0.9f),      // 暖白色
+    //     1.0f,                             // 强度
+    //     true                              // 可见
+    // );
+    // lights_.push_back(visible_area_light);
     
-    //创建一个可见的球光源
-    Light visible_sphere_light = Light::CreateSphereLight(
-        glm::vec3(-3.5f, 1.3f, 0.0f),     // 位置
-        0.15f,                             // 半径
-        glm::vec3(1.0f, 0.8f, 0.6f),      // 暖黄色
-        13.0f,                             // 强度
-        true                              // 可见
-    );
-    lights_.push_back(visible_sphere_light);
+    // //创建一个可见的球光源
+    // Light visible_sphere_light = Light::CreateSphereLight(
+    //     glm::vec3(-3.5f, 1.3f, 0.0f),     // 位置
+    //     0.15f,                             // 半径
+    //     glm::vec3(1.0f, 0.8f, 0.6f),      // 暖黄色
+    //     13.0f,                             // 强度
+    //     true                              // 可见
+    // );
+    // lights_.push_back(visible_sphere_light);
     
     // 不可见的点光源
     // Light invisible_point = Light::CreatePointLight(
@@ -261,16 +261,16 @@ void LightManager::CreateDefaultLights() {
     // );
     // lights_.push_back(invisible_point);
     
-    // 不可见的聚光灯
-    Light invisible_spot = Light::CreateSpotLight(
-        glm::vec3(5.0f, 5.0f, 3.0f),      // 位置
-        glm::vec3(-0.5f, -1.0f, -0.5f),    // 方向
-        glm::vec3(1.0f, 0.95f, 0.9f),     // 暖白色
-        10.0f,                             // 强度
-        30.0f,                            // 锥角
-        false                             // 不可见
-    );
-    lights_.push_back(invisible_spot);
+    // // 不可见的聚光灯
+    // Light invisible_spot = Light::CreateSpotLight(
+    //     glm::vec3(5.0f, 5.0f, 3.0f),      // 位置
+    //     glm::vec3(-0.5f, -1.0f, -0.5f),    // 方向
+    //     glm::vec3(1.0f, 0.95f, 0.9f),     // 暖白色
+    //     10.0f,                             // 强度
+    //     30.0f,                            // 锥角
+    //     false                             // 不可见
+    // );
+    // lights_.push_back(invisible_spot);
     
     // 更新缓冲区
     UpdateBuffers();
@@ -290,48 +290,3 @@ void LightManager::CreateDefaultLights() {
     grassland::LogInfo("Created {} default lights ({} visible entities)", 
                       lights_.size(), light_entities_.size());
 }
-
-// void LightManager::CreateDefaultLights() {
-//     if (!core_) {
-//         grassland::LogError("Light manager not initialized before creating default lights");
-//         return;
-//     }
-    
-//     lights_.clear();
-    
-//     Light main_directional = Light::CreateDirectionalLight(
-//         glm::vec3(5.0f, 5.0f, 2.5f),      // 位置（参考点）
-//         glm::vec3(-0.5f, -1.0f, -0.5f),   // 方向
-//         glm::vec3(1.0f, 0.95f, 0.9f),     // 暖白色
-//         3.0f,                             // 强度
-//         45.0f                             // 锥角
-//     );
-//     lights_.push_back(main_directional);
-    
-//     Light red_point = Light::CreatePointLight(
-//         glm::vec3(-5.0f, 2.0f, 1.0f),     // 位置
-//         glm::vec3(1.0f, 0.3f, 0.3f),      // 红色
-//         1.2f                              // 强度
-//     );
-//     lights_.push_back(red_point);
-    
-//     // Light blue_point = Light::CreatePointLight(
-//     //     glm::vec3(1.5f, 3.0f, -1.0f),     // 位置
-//     //     glm::vec3(0.3f, 0.3f, 1.0f),      // 蓝色
-//     //     1.2f                              // 强度
-//     // );
-//     // lights_.push_back(blue_point);
-    
-//     Light top_area = Light::CreateAreaLight(
-//         glm::vec3(0.0f, 5.0f, 0.0f),      // 位置
-//         glm::vec3(0.0f, -1.0f, 0.0f),     // 方向（向下）
-//         glm::vec2(1.0f, 1.0f),            // 尺寸
-//         glm::vec3(0.9f, 0.9f, 1.0f),      // 冷白色
-//         1.0f                              // 强度
-//     );
-//     lights_.push_back(top_area);
-    
-//     // 更新缓冲区
-//     UpdateBuffers();
-//     grassland::LogInfo("Created {} default lights", lights_.size());
-// }

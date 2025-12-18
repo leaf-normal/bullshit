@@ -74,6 +74,7 @@ struct RenderSettings {
     uint samples_per_pixel;
     uint max_depth;
     uint enable_accumulation;
+    int skybox_texture_id_;            // If not able, set to -1
 };
 
 ConstantBuffer<RenderSettings> render_setting : register(b0, space11);
@@ -114,7 +115,7 @@ StructuredBuffer<MotionParams> motion_groups : register(t0, space14);
 
 // Texture
 Texture2D<float4> g_Textures[128] : register(t0, space18);
-SamplerState g_Sampler : register(s0, space18);
+SamplerState g_Sampler : register(s0, space19);
 
 
 struct RayPayload {
@@ -1167,14 +1168,47 @@ void RayGenMain() {
 }
 
 // // ====================== 命中着色器 ======================
+// [shader("miss")]
+// void MissMain(inout RayPayload payload) {
+//     // 简化的天空渐变
+//     float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);
+//     payload.color = lerp(float3(1.0, 1.0, 1.0), float3(0.5, 0.7, 1.0), t) * 0.5;
+//     payload.hit = false;
+//     payload.instance_id = 0xFFFFFFFF;
+// }
 [shader("miss")]
 void MissMain(inout RayPayload payload) {
-    // 简化的天空渐变
-    float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);
-    payload.color = lerp(float3(1.0, 1.0, 1.0), float3(0.5, 0.7, 1.0), t) * 0.5;
     payload.hit = false;
     payload.instance_id = 0xFFFFFFFF;
+    
+    if (render_setting.skybox_texture_id_ >= 0) {
+        // 采样HDR天空盒
+        float3 normalizedDir = normalize(WorldRayDirection());
+        normalizedDir.z *= -1;
+        
+        float phi = atan2(normalizedDir.z, normalizedDir.x);
+        float theta = acos(clamp(normalizedDir.y, -1.0, 1.0));
+        
+        // 将球面坐标转换为UV坐标
+        float u = (phi + PI) / (2.0 * PI);
+        float v = theta / PI;
+        
+        // 确保UV在[0,1]范围内
+        u = frac(u);
+        v = clamp(v, 0.0, 1.0);
+        
+        // 采样HDR纹理（索引0是天空盒纹理）
+        float3 sky_color = g_Textures[render_setting.skybox_texture_id_].SampleLevel(g_Sampler, float2(u, v), 0).rgb;
+        
+        // 应用强度
+        payload.color = sky_color * 0.5;
+    } else {
+        // 简化的天空渐变（原有的）
+        float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);
+        payload.color = lerp(float3(0.5, 0.7, 1.0), float3(1.0, 1.0, 1.0), t) * 0.8;
+    }
 }
+
 
 [shader("closesthit")]
 void ClosestHitMain(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {

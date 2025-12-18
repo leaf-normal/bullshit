@@ -2,7 +2,7 @@
 #include "Material.h"
 #include "Entity.h"
 #include "TextureManager.h"
-#include "TextureManager.cpp"
+// #include "TextureManager.cpp"
 
 #include "glm/gtc/matrix_transform.hpp"
 #include "imgui.h"
@@ -44,7 +44,9 @@ Application::Application(grassland::graphics::BackendAPI api)
     , temp_camera_angular_velocity_(0.0f)
     // 滚轮状态
     , wheel_accumulator_(0.0)
-    , wheel_processed_(true) {
+    , wheel_processed_(true)
+    , enable_skybox_(false)
+    , skybox_texture_id_(-1) {
 
     grassland::graphics::CreateCore(api, grassland::graphics::Core::Settings{}, &core_);
     core_->InitializeLogicalDeviceAutoSelect(true);
@@ -367,15 +369,6 @@ void Application::OnInit() {
     mouse_x_ = 0.0;
     mouse_y_ = 0.0;
     
-    // 初始化渲染设置
-    core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
-    
-    RenderSettings initial_settings{};
-    initial_settings.frame_count = 0;
-    initial_settings.samples_per_pixel = samples_per_pixel_;
-    initial_settings.max_depth = 8;
-    initial_settings.enable_accumulation = 1;
-    render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
 
     // 创建场景
     scene_ = std::make_unique<Scene>(core_.get());
@@ -387,10 +380,44 @@ void Application::OnInit() {
     // 添加默认光源
     light_manager_->CreateDefaultLights();
 
+
     //初始化TextureManager
     texture_manager_=std::make_unique<TextureManager>(core_.get());
     //测试纹理
     int checkerTexId=texture_manager_->LoadTexture("textures/1.png");
+    //HDR
+    try {
+        skybox_texture_id_ = texture_manager_->LoadHDRTexture("textures/skybox.hdr");
+        enable_skybox_ = true;
+        // skybox_intensity_ = 1.0f;
+        // skybox_rotation_ = 0.0f;
+        grassland::LogInfo("HDR Skybox loaded successfully");
+    } catch (const std::exception& e) {
+        grassland::LogWarning("Failed to load HDR skybox: {}. Using gradient sky.", e.what());
+        enable_skybox_ = false;
+        skybox_texture_id_ = -1;
+    }
+    // 创建Sampler
+    grassland::graphics::SamplerInfo sampler_desc;
+    sampler_desc.min_filter = grassland::graphics::FILTER_MODE_LINEAR;
+    sampler_desc.mag_filter = grassland::graphics::FILTER_MODE_LINEAR;
+    sampler_desc.address_mode_u = grassland::graphics::ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_desc.address_mode_v = grassland::graphics::ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_desc.address_mode_w = grassland::graphics::ADDRESS_MODE_CLAMP_TO_EDGE;
+    core_->CreateSampler(sampler_desc, &sampler_);
+
+
+    // 初始化渲染设置
+    core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
+    
+    RenderSettings initial_settings{};
+    initial_settings.frame_count = 0;
+    initial_settings.samples_per_pixel = samples_per_pixel_;
+    initial_settings.max_depth = 8;
+    initial_settings.enable_accumulation = 1;
+    initial_settings.skybox_texture_id_ = skybox_texture_id_;
+    render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
+
 
     // 添加实体
     {
@@ -410,8 +437,11 @@ void Application::OnInit() {
     {
         auto red_sphere = std::make_shared<Entity>(
             "meshes/octahedron.obj",
-            Material(glm::vec3(0.95f, 0.0f, 0.0f), 0.4f, 0.1f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0, 1.0, 0.1
+            Material(glm::vec3(0.99f, 0.97f, 0.97f), 0.15f, 0.1f,
+            0xFFFFFFFF, glm::vec3(0, 0, 0), 1.1, 0.98, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0
+
+            // Material(glm::vec3(0.95f, 0.0f, 0.0f), 0.4f, 0.1f,
+            // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0, 1.0, 0.1
         ),
                 glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
         );
@@ -534,7 +564,8 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_ACCELERATION_STRUCTURE, 1);  // space17 - new AS
 
     //Texture
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 128);
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_IMAGE, 128);                 // space18 - textures
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_SAMPLER, 1);                 // space19 - sampler
     try {
         program_->Finalize();
         grassland::LogInfo("Ray tracing program finalized successfully");
@@ -633,6 +664,7 @@ void Application::OnUpdate() {
         settings.samples_per_pixel = samples_per_pixel_;
         settings.max_depth = 8;
         settings.enable_accumulation = !camera_enabled_;
+        settings.skybox_texture_id_ = skybox_texture_id_;
         
         render_settings_buffer_->UploadData(&settings, sizeof(RenderSettings));
 
@@ -1360,19 +1392,23 @@ void Application::OnRender() {
     command_context->CmdBindResources(15, { scene_->GetTLAS(1) }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(16, { scene_->GetTLAS(2) }, grassland::graphics::BIND_POINT_RAYTRACING);
     command_context->CmdBindResources(17, { scene_->GetTLAS(3) }, grassland::graphics::BIND_POINT_RAYTRACING);
+
+    // texture
     std::vector<grassland::graphics::Image*> texture_images;
-    texture_images.push_back(texture_manager_->GetTexture(0)->gpuImage.get());
-    
+    int texture_number = texture_manager_->TextureCount();
+    for(int i = 0; i < texture_number; i++){
+        texture_images.push_back(texture_manager_->GetTexture(i)->gpuImage.get());
+    }
     // 创建一个 1x1 的占位图像
     std::shared_ptr<grassland::graphics::Image> dummyImage;
     core_->CreateImage(1, 1, grassland::graphics::IMAGE_FORMAT_R8G8B8A8_UNORM, &dummyImage);
     uint8_t pixel[4] = {0, 0, 0, 255};
     dummyImage->UploadData(pixel);
-
-    for (int i = 1; i < 128; ++i) {
-        texture_images.push_back(dummyImage.get()); // 或 dummy 图像
+    for (int i = texture_number; i < 128; ++i) {
+        texture_images.push_back(dummyImage.get());
     }
     command_context->CmdBindResources(18, texture_images, grassland::graphics::BIND_POINT_RAYTRACING);
+    command_context->CmdBindResources(19, { sampler_.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
 
     command_context->CmdDispatchRays(window_->GetWidth(), window_->GetHeight(), 1);
     

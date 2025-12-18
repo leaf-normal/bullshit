@@ -22,6 +22,7 @@ struct CameraObject {
     float camera_angular_velocity; // 相机角速度（绕相机方向的旋转）
     int enable_motion_blur;            // 是否启用运动模糊
     float exposure_time;               // 曝光时间（秒）
+
 };
 
 struct RenderSettings {  // Mainly for random seed
@@ -29,6 +30,8 @@ struct RenderSettings {  // Mainly for random seed
     uint32_t samples_per_pixel;
     uint32_t max_depth;
     uint32_t enable_accumulation;
+    // HDR
+    int skybox_texture_id_;            // If not able, set to -1
 };
 
 class Application {
@@ -153,5 +156,10 @@ private:
     // 应用运动模糊参数
     void ApplyMotionBlurParams();
 
+    // 贴图相关
     std::unique_ptr<TextureManager> texture_manager_;
+    // HDR
+    bool enable_skybox_;                          // 是否启用天空盒
+    int skybox_texture_id_; 
+    std::shared_ptr<grassland::graphics::Sampler> sampler_;
 };
