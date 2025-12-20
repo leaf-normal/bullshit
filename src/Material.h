@@ -11,7 +11,9 @@ struct Material {
     float ior;              // 折射率
     float transparency;     // 透明度
     int texture_id;       
-  
+    int normal_tex_id;
+    int attribute_tex_id;  
+
     float subsurface;       // 次表面散射
     float specular;         // 镜面反射强度
     float specular_tint;    // 镜面反射
@@ -32,6 +34,8 @@ struct Material {
         ior(1.0f),
         transparency(0.0f),
         texture_id(-1),  // -1 表示没有纹理
+        normal_tex_id(-1),
+        attribute_tex_id(-1),
         subsurface(0.0f),
         specular(0.0f),
         specular_tint(0.0f),
@@ -45,7 +49,7 @@ struct Material {
     
     Material(const glm::vec3& color, float rough = 0.5f, float metal = 0.0f, 
              uint32_t index = 0xFFFFFFFF, const glm::vec3& emit = glm::vec3(0.0f, 0.0f, 0.0f),
-             float refractive_index = 1.0f, float trans = 0.0f, int tex_id = -1,
+             float refractive_index = 1.0f, float trans = 0.0f, int tex_id = -1, int nor_id = -1, int att_id = -1,
              float sub = 0.0f, float spec = 0.0f, float spec_tint = 0.0f,
              float aniso = 0.0f, float sh = 0.0f, float sh_tint = 0.0f,
              float coat = 0.0f, float coat_rough = 0.0f) : 
@@ -57,6 +61,8 @@ struct Material {
         ior(refractive_index),
         transparency(trans),
         texture_id(tex_id),
+        normal_tex_id(nor_id),
+        attribute_tex_id(att_id),
         subsurface(sub),
         specular(spec),
         specular_tint(spec_tint),
