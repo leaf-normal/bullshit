@@ -1307,8 +1307,8 @@ MediumState GetCurrentMedium()
     MediumState m;
     if (render_setting.global_medium_enabled != 0) {
         m.enabled = true;
-        m.sigma_a = render_setting.global_sigma_a;
-        m.sigma_s = render_setting.global_sigma_s;
+        m.sigma_a = max(render_setting.global_sigma_a, EPS);
+        m.sigma_s = max(render_setting.global_sigma_s, EPS);
         m.sigma_t = m.sigma_a + m.sigma_s;
         m.Le      = render_setting.global_Le;
     } else {
@@ -1839,10 +1839,12 @@ void RayGenMain() {
 
         bool scatter_in_medium = false;
         float t_medium = 0.0f;
+
         if (medium_has_ext) {
-            float sigma_t_scalar = (medium.sigma_t.x + medium.sigma_t.y + medium.sigma_t.z) / 3.0;  // 使用平均值近似
-            float u = max(random(seed), 1e-6);
-            t_medium = -log(u) / sigma_t_scalar;
+            int channel_idx = min((int)(random(seed) * 3.0), 2); // 0, 1, or 2
+
+            t_medium = -log(max(random(seed), 1e-6)) / medium.sigma_t[channel_idx];
+            
             if (t_medium < surface_dist) {
                 scatter_in_medium = true;
             }
@@ -1851,17 +1853,15 @@ void RayGenMain() {
 
                 // 路径前缀上的 Beer（到 scattering 点）
                 float3 T = exp(-medium.sigma_t * t_medium);
-                throughput *= T;
 
+                float3 pdf_t = dot(medium.sigma_t, T) / 3.0;
+                
                 // 体积自发光
                 if (any(medium.Le > 0.0)) {
-                    color += throughput * medium.Le / sigma_t_scalar; // 这里可以微调
+                    color += (1.0 - T) * medium.Le / medium.sigma_t * (throughput / pdf_t); // 此处独立计算
                 }
 
-                // 单次散射：N·L 换成 phase function
-                float3 sigma_s = medium.sigma_s;
-                float3 albedo = sigma_s / max(medium.sigma_t, 1e-6);
-                throughput *= albedo;
+                throughput *= medium.sigma_s * T / pdf_t;
 
                 // 采样 lights（和 surface 的 direct 类似，只是 BSDF 换成 phase function）
                 float3 vol_direct = mis_direct_lighting(light_count, scatter_point, float3(0.0f, 0.0f, 0.0f), mat, float3(0.0f, 0.0f, 0.0f), payload.is_filp, seed);
@@ -1891,12 +1891,13 @@ void RayGenMain() {
                 // NOTE：payload 这轮里用于 surface 的信息全部丢弃，进入下一 bounce
                 continue;
             }else{
-                float3 T = exp(-medium.sigma_t * surface_dist);
-                throughput *= T;
-                
+                float3 T_surf = exp(-medium.sigma_t * surface_dist);
+                float pdf_t = (T_surf.r + T_surf.g + T_surf.b) / 3.0; // 显式定义概率
+
                 if (any(medium.Le > 0.0)) {
-                    color += (1.0 - T) * medium.Le / sigma_t_scalar;
+                    color += (1.0 - T_surf) * medium.Le / medium.sigma_t * (throughput / pdf_t);
                 }
+                throughput *= T_surf / pdf_t;
             }
         }
 
