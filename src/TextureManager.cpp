@@ -4,6 +4,84 @@
 #include <stdexcept>
 #include "grassland/graphics/image.h"
 
+static int ComputeMaxMipLevels(int w, int h) {
+    int levels = 1;
+    while (w > 1 || h > 1) {
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+        levels++;
+    }
+    return levels;
+}
+
+// LDR: RGBA8
+std::vector<std::vector<unsigned char>>
+TextureManager::BuildMipChainRGBA8(const unsigned char* base, int width, int height) {
+    std::vector<std::vector<unsigned char>> mips;
+    mips.emplace_back(base, base + width * height * 4);
+    int w = width, h = height;
+    while (w > 1 || h > 1)
+    {
+        int nw = std::max(1, w / 2);
+        int nh = std::max(1, h / 2);
+        std::vector<unsigned char> next(nw * nh * 4);
+        auto fetch = [&](int x, int y, int c) {
+            int ix = std::clamp(x, 0, w - 1);
+            int iy = std::clamp(y, 0, h - 1);
+            return mips.back()[(iy * w + ix) * 4 + c];
+        };
+        for (int y = 0; y < nh; ++y) {
+            for (int x = 0; x < nw; ++x) {
+                int sx = x * 2, sy = y * 2;
+                for (int c = 0; c < 4; ++c) {
+                    int sum = 0;
+                    sum += fetch(sx + 0, sy + 0, c);
+                    sum += fetch(sx + 1, sy + 0, c);
+                    sum += fetch(sx + 0, sy + 1, c);
+                    sum += fetch(sx + 1, sy + 1, c);
+                    next[(y * nw + x) * 4 + c] = (unsigned char)(sum / 4);
+                }
+            }
+        }
+        mips.push_back(std::move(next));
+        w = nw; h = nh;
+    }
+    return mips;
+}
+//HDR: RGB32
+std::vector<std::vector<float>>
+TextureManager::BuildMipChainRGBA32(const float* base, int width, int height) {
+    std::vector<std::vector<float>> mips;
+    mips.emplace_back(base, base + width * height * 4);
+    int w = width, h = height;
+    while (w > 1 || h > 1) {
+        int nw = std::max(1, w / 2);
+        int nh = std::max(1, h / 2);
+        std::vector<float> next(nw * nh * 4);
+        auto fetch = [&](int x, int y, int c) {
+            int ix = std::clamp(x, 0, w - 1);
+            int iy = std::clamp(y, 0, h - 1);
+            return mips.back()[(iy * w + ix) * 4 + c];
+        };
+        for (int y = 0; y < nh; ++y) {
+            for (int x = 0; x < nw; ++x) {
+                int sx = x * 2, sy = y * 2;
+                for (int c = 0; c < 4; ++c) {
+                    float sum = 0;
+                    sum += fetch(sx + 0, sy + 0, c);
+                    sum += fetch(sx + 1, sy + 0, c);
+                    sum += fetch(sx + 0, sy + 1, c);
+                    sum += fetch(sx + 1, sy + 1, c);
+                    next[(y * nw + x) * 4 + c] = (float)(sum / 4.0);
+                }
+            }
+        }
+        mips.push_back(std::move(next));
+        w = nw; h = nh;
+    }
+    return mips;
+}
+
 int TextureManager::LoadTexture(const std::string& filename) {
     Texture tex{};
     unsigned char* img = stbi_load(filename.c_str(), &tex.width, &tex.height, &tex.channels, 4);
@@ -13,17 +91,26 @@ int TextureManager::LoadTexture(const std::string& filename) {
     tex.data.assign(img, img + tex.width * tex.height * 4);
     stbi_image_free(img);
 
-    // 创建 GPU Image
-    core_->CreateImage(tex.width, tex.height,
-        grassland::graphics::IMAGE_FORMAT_R8G8B8A8_UNORM,
-        &tex.gpuImage);
-
-    tex.gpuImage->UploadData(tex.data.data());
-    grassland::LogInfo("Texture loaded: {} ({}x{}, {} channels)", filename, tex.width, tex.height, tex.channels);
+    auto mip_chain = BuildMipChainRGBA8(tex.data.data(), tex.width, tex.height);
+    tex.mip_levels = (int)mip_chain.size();
+    int w = tex.width, h = tex.height;
+    tex.has_mipmap=(tex.mip_levels>1);
+    for (int level = 0; level < tex.mip_levels; ++level) {
+        std::shared_ptr<grassland::graphics::Image> image;
+        core_->CreateImage(w, h, grassland::graphics::IMAGE_FORMAT_R8G8B8A8_UNORM, &image);
+        image->UploadData(mip_chain[level].data());
+        tex.mipImages.push_back(image);
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+    }
+    tex.gpuImage = tex.mipImages[0];
+    grassland::LogInfo("Texture loaded with simulated mipmaps: {} ({}x{}, levels={})",
+                       filename, tex.width, tex.height, tex.mip_levels);
     textures_.push_back(std::move(tex));
-    
-    return static_cast<int>(textures_.size() - 1); // 返回纹理ID
+    mip_info_buffer_.reset();
+    return static_cast<int>(textures_.size() - 1);
 }
+
 
 int TextureManager::LoadHDRTexture(const std::string& filename, float intensity = 1.0) {
     Texture tex{};
@@ -49,23 +136,37 @@ int TextureManager::LoadHDRTexture(const std::string& filename, float intensity 
         }
     } else if (tex.channels == 4) {
         memcpy(tex.hdr_data.data(), img, pixel_count * 4 * sizeof(float));
+        for (size_t i = 0; i < pixel_count; ++i) {
+            tex.hdr_data[i*4 + 0] *= intensity;
+            tex.hdr_data[i*4 + 1] *= intensity;
+            tex.hdr_data[i*4 + 2] *= intensity;
+        }
     }
     
     stbi_image_free(img);
     
-    core_->CreateImage(tex.width, tex.height,
-        grassland::graphics::IMAGE_FORMAT_R32G32B32A32_SFLOAT,
-        &tex.gpuImage);
-    
-    tex.gpuImage->UploadData(tex.hdr_data.data());
+    auto mip_chain = BuildMipChainRGBA32(tex.hdr_data.data(), tex.width, tex.height);
+    tex.mip_levels = (int)mip_chain.size();
+    tex.has_mipmap = (tex.mip_levels > 1);
+    int w = tex.width, h = tex.height;
+    for (int level = 0; level < tex.mip_levels; ++level)
+    {
+        std::shared_ptr<grassland::graphics::Image> image;
+        core_->CreateImage(w, h, grassland::graphics::IMAGE_FORMAT_R32G32B32A32_SFLOAT, &image);
+        image->UploadData(mip_chain[level].data());
+        tex.mipImages.push_back(image);
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+    }
+    tex.gpuImage = tex.mipImages[0];
     
     grassland::LogInfo("HDR Texture loaded: {} ({}x{}, {} channels)", 
                       filename, tex.width, tex.height, tex.channels);
-    
 
     ComputeHDRDistribution(tex);
 
     textures_.push_back(std::move(tex));
+    mip_info_buffer_.reset();
     return static_cast<int>(textures_.size() - 1);
 }
 
@@ -221,4 +322,45 @@ float TextureManager::GetHDRTotalLuminance(int texture_id) const {
 Texture* TextureManager::GetTexture(int id) {
     if (id < 0 || id >= (int)textures_.size()) return nullptr;
     return &textures_[id];
+}
+
+
+void TextureManager::CollectMipImages(std::vector<grassland::graphics::Image*>& outImages) const {
+    outImages.clear();
+    for (const auto& tex : textures_) {
+        if (tex.mipImages.empty()) continue;
+        for (const auto& img : tex.mipImages) {
+            outImages.push_back(img.get());
+        }
+    }
+}
+
+void TextureManager::BuildMipInfo(std::vector<MipInfo>& outInfos) const {
+    outInfos.clear();
+    uint32_t runningStart = 0;
+    for (const auto& tex : textures_) {
+        MipInfo info{};
+        info.start = runningStart;
+        info.levels = (uint32_t)tex.mip_levels;
+        outInfos.push_back(info);
+        runningStart += info.levels;
+    }
+}
+
+grassland::graphics::Buffer* TextureManager::GetOrCreateMipInfoBuffer() {
+    if (mip_info_buffer_) return mip_info_buffer_.get();
+
+    std::vector<MipInfo> infos;
+    BuildMipInfo(infos);
+
+    if (infos.empty()) {
+        // 保证至少有一个元素，避免空缓冲绑定
+        infos.push_back({0u, 0u});
+    }
+
+    size_t sz = infos.size() * sizeof(MipInfo);
+    core_->CreateBuffer(sz, grassland::graphics::BUFFER_TYPE_DYNAMIC, &mip_info_buffer_);
+    mip_info_buffer_->UploadData(infos.data(), sz);
+
+    return mip_info_buffer_.get();
 }

@@ -6,6 +6,8 @@
 #include "TextureManager.h"
 #include <memory>
 
+#define MAX_DEPTH 16
+
 struct CameraObject {
     glm::mat4 screen_to_camera;
     glm::mat4 camera_to_world;
@@ -22,7 +24,7 @@ struct CameraObject {
     float camera_angular_velocity; // 相机角速度（绕相机方向的旋转）
     int enable_motion_blur;            // 是否启用运动模糊
     float exposure_time;               // 曝光时间（秒）
-
+    int enable_dispersion;         // 是否启用光色散
 };
 
 struct RenderSettings {  // Mainly for random seed
@@ -33,6 +35,12 @@ struct RenderSettings {  // Mainly for random seed
     uint32_t light_count;
     // HDR
     int skybox_texture_id_;            // If not able, set to -1
+
+    glm::vec2 resolution;
+    int  global_medium_enabled;
+    glm::vec3 global_sigma_a;
+    glm::vec3 global_sigma_s;
+    glm::vec3 global_Le;
 };
 
 class Application {
@@ -153,6 +161,8 @@ private:
     float temp_exposure_time_;
     glm::vec3 temp_camera_linear_velocity_;
     float temp_camera_angular_velocity_;
+    
+    bool dispersion_enabled_;           // 是否启用色散
         
     // 应用运动模糊参数
     void ApplyMotionBlurParams();
@@ -163,4 +173,6 @@ private:
     bool enable_skybox_;                          // 是否启用天空盒
     int skybox_texture_id_; 
     std::shared_ptr<grassland::graphics::Sampler> sampler_;
+
+    std::unique_ptr<grassland::graphics::Buffer> media_buffer_;
 };

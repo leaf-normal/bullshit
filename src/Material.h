@@ -25,6 +25,10 @@ struct Material {
 
     uint32_t group_id;
 
+    float A, B, C;      // 折射率系数
+    int medium_id;
+
+
     Material() : 
         base_color(0.8f, 0.8f, 0.8f), 
         roughness(0.5f), 
@@ -44,21 +48,24 @@ struct Material {
         sheen_tint(0.0f),
         clearcoat(0.0f),
         clearcoat_roughness(0.0f),
-        group_id(0) {}
+        group_id(0),
+        A(1.0), B(0.0), C(0.0),
+        medium_id(-1){}
     
     
     Material(const glm::vec3& color, float rough = 0.5f, float metal = 0.0f, 
              uint32_t index = 0xFFFFFFFF, const glm::vec3& emit = glm::vec3(0.0f, 0.0f, 0.0f),
-             float refractive_index = 1.0f, float trans = 0.0f, int tex_id = -1, int nor_id = -1, int att_id = -1,
+             float IOR = 1.0f, float trans = 0.0f, int tex_id = -1, int nor_id = -1, int att_id = -1,
              float sub = 0.0f, float spec = 0.0f, float spec_tint = 0.0f,
              float aniso = 0.0f, float sh = 0.0f, float sh_tint = 0.0f,
-             float coat = 0.0f, float coat_rough = 0.0f) : 
+             float coat = 0.0f, float coat_rough = 0.0f,
+             float a = 1.1f, float b = 0.0f, float c = 0.0f, int med_id = -1) : 
         base_color(color), 
         roughness(rough), 
         metallic(metal), 
         light_index(index),
         emission(emit),
-        ior(refractive_index),
+        ior(IOR),
         transparency(trans),
         texture_id(tex_id),
         normal_tex_id(nor_id),
@@ -71,5 +78,14 @@ struct Material {
         sheen_tint(sh_tint),
         clearcoat(coat),
         clearcoat_roughness(coat_rough),
-        group_id(0) {}
+        group_id(0),
+        A(a), B(b), C(c),
+        medium_id(med_id) {}
+};
+
+struct MediumParams{
+    glm::vec3 sigma_a;
+    glm::vec3 sigma_s;
+    glm::vec3 Le;
+    int enabled;
 };

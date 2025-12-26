@@ -24,8 +24,17 @@ struct Texture {
     std::vector<float> hdr_data;          // 用于HDR纹理
     std::shared_ptr<grassland::graphics::Image> gpuImage;
 
+    std::vector<std::shared_ptr<grassland::graphics::Image>> mipImages;
+    int mip_levels;
+    bool has_mipmap=false;
+
     HDRDistributionData hdr_distribution; // HDR分布数据
     bool has_hdr_distribution;            // 是否已计算分布数据
+};
+
+struct MipInfo{
+    uint32_t start;
+    uint32_t levels;
 };
 
 class TextureManager {
@@ -51,6 +60,11 @@ public:
         
         return texture.hdr_distribution.cdf_buffer.get();
     }
+    
+    void CollectMipImages(std::vector<grassland::graphics::Image*>& outImages) const;
+    void BuildMipInfo(std::vector<MipInfo>& outInfos) const;
+    grassland::graphics::Buffer* GetOrCreateMipInfoBuffer();
+
 
 private:
     grassland::graphics::Core* core_;
@@ -59,4 +73,8 @@ private:
     // HDR分布计算辅助函数
     void ComputeHDRDistribution(Texture& texture);
     float ComputeLuminance(const glm::vec3& rgb) const;
+
+    static std::vector<std::vector<unsigned char>> BuildMipChainRGBA8(const unsigned char* base, int width, int height);
+    static std::vector<std::vector<float>> BuildMipChainRGBA32(const float* base, int width, int height);
+    std::shared_ptr<grassland::graphics::Buffer> mip_info_buffer_;
 };
