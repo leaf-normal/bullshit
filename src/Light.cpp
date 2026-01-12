@@ -149,9 +149,9 @@ std::shared_ptr<Entity> LightManager::CreateLightEntity(const Light& light, size
         transform = CalculateAreaLightTransform(light);
     } 
     else if (light.type == 3) { // 球光源
-        mesh_path = "meshes/icosahedron_light.obj"; // 半径为0.5的正二十面体
+        mesh_path = "meshes/ball.obj"; // 半径为1.0的球体
         // 移动到光源位置并缩放到正确半径
-        float scale = light.radius * 2.0f; // 因为原始模型半径为0.5，所以要×2
+        float scale = light.radius;
         transform = glm::scale(
             glm::translate(glm::mat4(1.0f), light.position),
             glm::vec3(scale)
@@ -257,45 +257,60 @@ void LightManager::CreateDefaultLights() {
     //     true                             // 可见
     // );
     // lights_.push_back(dispersive_light);
-    // //创建一个可见的面光源作为示例
+
+    // // 创建一个可见的面光源作为示例
     // Light visible_area_light = Light::CreateAreaLight(
-    //     glm::vec3(0.0f, 3.0f, 0.0f),      // 位置
+    //     glm::vec3(3.0f, 3.55f, 0.5f),      // 位置
     //     glm::vec3(0.0f, -1.0f, 0.0f),     // 法线方向（向下）
     //     glm::vec3(1.0f, 0.0f, 0.0f),      // 切向量（指向X轴）
-    //     glm::vec2(2.0f, 2.0f),            // 尺寸
-    //     glm::vec3(1.0f, 1.0f, 0.9f),      // 暖白色
-    //     1.0f,                             // 强度
-    //     true                              // 可见
+    //     glm::vec2(2.0f, 0.4f),            // 尺寸
+    //     glm::vec3(1.0f, 0.8f, 0.6f),      // 暖白色
+    //     4.0f,                             // 强度
+    //     false                              // 可见
     // );
     // lights_.push_back(visible_area_light);
-    
-    //创建一个可见的球光源
-    Light visible_sphere_light = Light::CreateSphereLight(
-        glm::vec3(-0.0f, 1.5f, -3.0f),     // 位置
-        0.15f,                             // 半径
-        glm::vec3(1.0f, 0.8f, 0.6f),      // 暖黄色
-        13.0f,                             // 强度
-        true                              // 可见
-    );
-    lights_.push_back(visible_sphere_light);
+
+    // // 创建一个可见的面光源作为示例
+    // Light light_2 = Light::CreateAreaLight(
+    //     glm::vec3(-8.0f, 6.0f, 10.0f),      // 位置
+    //     glm::vec3(0.6f, -0.3, -1.0f),     // 法线方向（向下）
+    //     glm::vec3(1.0f, 0.0f, 0.0f),      // 切向量（指向X轴）
+    //     glm::vec2(5.0f, 5.0f),            // 尺寸
+    //     glm::vec3(0.9f, 0.8f, 0.6f),      // 暖白色
+    //     5.5f,                             // 强度
+    //     true                              // 可见
+    // );
+    // lights_.push_back(light_2);    
+
+    // //创建一个可见的球光源
+    // Light visible_sphere_light = Light::CreateSphereLight(
+    //     glm::vec3(50.0f, 10.0f, 50.0f),     // 位置
+    //     0.25f,                             // 半径
+    //     glm::vec3(1.0f, 0.8f, 0.6f),      // 暖黄色
+    //     50000.0f,                             // 强度
+    //     true                              // 可见
+    // );
+    // lights_.push_back(visible_sphere_light);
     
     // 不可见的点光源
     // Light invisible_point = Light::CreatePointLight(
     //     // glm::vec3(1.5f, 2.0f, -3.0f),      // 位置
-    //     glm::vec3(0.0f, 2.7f, 0.7f),      // 位置
+    //     glm::vec3(50.0f, 15.0f, 50.0f),      // 位置
     //     glm::vec3(0.8f, 0.9f, 1.0f),      // 冷蓝色
-    //     1.6f,                             // 强度
+    //     9000.0f,                             // 强度
     //     false                             // 不可见
     // );
     // lights_.push_back(invisible_point);
     
     // // 不可见的聚光灯
     // Light invisible_spot = Light::CreateSpotLight(
-    //     glm::vec3(5.0f, 5.0f, 3.0f),      // 位置
-    //     glm::vec3(-0.5f, -1.0f, -0.5f),    // 方向
+    //     // glm::vec3(5.0f, 5.0f, 3.0f),      // 位置
+    //     // glm::vec3(-0.5f, -1.0f, -0.5f),    // 方向
+    //     glm::vec3(2.0f, 2.00f, -4.0f),
+    //     glm::vec3(0.0f, -0.065f, 1.0f),
     //     glm::vec3(1.0f, 0.95f, 0.9f),     // 暖白色
-    //     10.0f,                             // 强度
-    //     30.0f,                            // 锥角
+    //     150.0f,                             // 强度
+    //     8.0f,                            // 锥角
     //     false                             // 不可见
     // );
     // lights_.push_back(invisible_spot);

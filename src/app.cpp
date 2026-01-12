@@ -5,6 +5,8 @@
 #include "TextureManager.h"
 
 #include "glm/gtc/matrix_transform.hpp"
+#include <glm/gtc/quaternion.hpp>
+
 #include "imgui.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -23,9 +25,9 @@ Application::Application(grassland::graphics::BackendAPI api)
     : frame_count_(0)
     , samples_per_pixel_(1)
     // 实际景深参数
-    , focal_distance_(5.0f)
-    , aperture_size_(0.1f)
-    , focal_length_(0.035f)
+    , focal_distance_(2.0f)
+    , aperture_size_(0.04f)
+    , focal_length_(0.030f)
     // 临时景深参数（初始化为实际值）
     , temp_focal_distance_(5.0f)
     , temp_aperture_size_(0.1f)
@@ -476,6 +478,121 @@ void AddAnisotropicTestColumn(
     }
 }
 
+// 在 app.cpp 中，在 OnInit 之前添加以下函数
+
+void CreateLightColumn(
+    std::unique_ptr<Scene>& scene,
+    const glm::vec3& pass_through_point,  // 光柱经过的靠近原点的点
+    const glm::vec3& far_start,           // 远端起点
+    const glm::vec3& far_end,             // 远端终点
+    float column_thickness = 0.15f,       // 光柱粗细
+    const glm::vec3& emission_color = glm::vec3(1.0f, 1.0f, 1.0f),  // 纯白发光
+    float emission_intensity = 2.0f       // 发光强度
+) {
+    // 计算光柱方向（从远端起点到远端终点）
+    glm::vec3 direction = glm::normalize(pass_through_point - far_start);
+    
+    // 计算光柱总长度
+    float total_length = glm::length(far_end - far_start);
+    
+    // 创建发光材质
+    Material light_material(
+        glm::vec3(0.0f, 0.0f, 0.0f),  // base_color 为黑色，主要通过 emission 发光
+        0.5f,              // roughness
+        0.0f,              // metallic
+        0xFFFFFFFF,        // light_index (没有关联到 LightManager 的光源，作为纯几何自发光)
+        emission_color * emission_intensity / 3.5f,  // emission
+        1.005f,              // ior
+        0.5f,              // transparency
+        -1, -1, -1,        // texture ids
+        0.0f, 0.0f, 0.0f, 0.0f,  // subsurface, specular, specular_tint, anisotropic
+        0.0f, 0.0f, 0.0f, 0.0f,  // sheen, sheen_tint, clearcoat, clearcoat_roughness
+        1.0f, 0.0f, 0.0f   // A, B, C
+    );
+    
+    // 计算光柱中心位置（pass_through_point）
+    glm::vec3 center_position = pass_through_point;
+    
+    // 构建变换矩阵
+    // 1. 先沿 Y 轴拉伸（cube 默认方向）
+    glm::mat4 scale = glm::scale(
+        glm::mat4(1.0f),
+        glm::vec3(column_thickness, total_length, column_thickness)
+    );
+    
+    // 2. 旋转到目标方向
+    // cube 默认沿 Y 轴，需要将 Y 轴旋转到 direction
+    glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+    glm::vec3 rotation_axis = glm::normalize(glm::cross(up, direction));
+    float rotation_angle = glm::acos(glm::clamp(glm::dot(up, direction), -1.0f, 1.0f));
+    glm::mat4 rotation;
+    if (glm::length(rotation_axis) > 0.001f) {
+        rotation = glm::rotate(glm::mat4(1.0f), rotation_angle, rotation_axis);
+    } else {
+        // 方向与 Y 轴平行或相反
+        if (direction.y < 0.0f) {
+            rotation = glm::rotate(glm::mat4(1.0f), glm::pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f));
+        } else {
+            rotation = glm::mat4(1.0f);
+        }
+    }
+    
+    // 3. 平移到中心位置
+    glm::mat4 translation = glm::translate(glm::mat4(1.0f), center_position);
+    
+    // 组合变换：先缩放，再旋转，最后平移
+    glm::mat4 transform = translation * rotation * scale;
+    
+    // 创建实体
+    auto light_column = std::make_shared<Entity>("meshes/cube.obj", light_material, transform);
+    scene->AddEntity(light_column);
+}
+
+void AddLightColumnsScene(std::unique_ptr<Scene>& scene) {
+    // 定义远端点
+    glm::vec3 far_start = glm::vec3(-35.0f, -50.0f, -20.0f);
+    glm::vec3 far_end = glm::vec3(50.0f, 50.0f, 50.0f);
+    
+    struct LightColumnParam {
+        glm::vec3 position;
+        float thickness;
+        float intensity;
+        glm::vec3 color; // 新增颜色字段
+    };
+
+    std::vector<LightColumnParam> light_columns = {
+        // === 近景光柱 === 
+        // 1. 粗主光柱 (红)
+        { glm::vec3(1.9f, 0.5f, 3.0f), 0.30f, 6.0f, glm::vec3(1.0f, 0.0f, 0.0f) },
+        
+        // 2. 细光柱 (橙)
+        { glm::vec3(-3.5f, 0.5f, 2.5f), 0.12f, 4.0f, glm::vec3(1.0f, 0.5f, 0.0f) },
+        
+        // === 中景光柱 ===
+        // 3. 右侧中景 (黄)
+        { glm::vec3(1.9f, 1.0f, 1.5f), 0.18f, 4.5f, glm::vec3(1.0f, 1.0f, 0.0f) },
+        
+        // 4. 左侧中景 (绿)
+        { glm::vec3(-3.0f, 0.0f, 1.0f), 0.15f, 4.0f, glm::vec3(0.0f, 1.0f, 0.0f) },
+        
+        // === 远景光柱 ===
+        // 5. 中心远景 (青)
+        { glm::vec3(-0.3f, 1.5f, 0.5f), 0.12f, 3.5f, glm::vec3(0.0f, 1.0f, 1.0f) },
+        
+        // 6. 左后方远景 (蓝)
+        { glm::vec3(-1.5f, 1.0f, -0.5f), 0.08f, 3.5f, glm::vec3(0.0f, 0.0f, 1.0f) },
+        
+        // 7. 最远的光柱 (紫)
+        { glm::vec3(0.4f, -0.5f, -1.0f), 0.06f, 3.0f, glm::vec3(0.5f, 0.0f, 1.0f) },
+    };
+
+    // 创建所有光柱
+    for (const auto& col : light_columns) {
+        CreateLightColumn(scene, col.position, far_start, far_end, 
+                        col.thickness, col.color, col.intensity); // 使用结构体中的颜色
+    }
+}
+
 
 
 void Application::OnInit() {
@@ -519,13 +636,13 @@ void Application::OnInit() {
     //初始化TextureManager
     texture_manager_ = std::make_unique<TextureManager>(core_.get());
     //测试纹理
-    int colorTexId = texture_manager_->LoadTexture("textures/yy.png");
-    // int normalTexId=texture_manager_->LoadTexture("textures/2.png");
-    int normalTexId = -1;
-    // int attributeTexId=texture_manager_->LoadTexture("textures/3.png");
+    // int colorTexId = texture_manager_->LoadTexture("textures/food_pomegranate_01_diff_4k.jpg");
+    // int normalTexId=texture_manager_->LoadTexture("textures/food_pomegranate_01_nor_gl_4k.exr");
+    // int normalTexId = -1;
+    // int attributeTexId=texture_manager_->LoadTexture("textures/food_pomegranate_01_rough_4k.jpg");
     //HDR
     try {
-        skybox_texture_id_ = texture_manager_->LoadHDRTexture("textures/skybox.hdr", 
+        skybox_texture_id_ = texture_manager_->LoadHDRTexture("textures/skybox", 
                                                             MUL_INTENS_SKYBOX); // set in light.h
         enable_skybox_ = true;
         // skybox_intensity_ = 1.0f;
@@ -587,413 +704,60 @@ void Application::OnInit() {
     render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
 
 
-    // 添加实体
-    {
-        auto ground = std::make_shared<Entity>(
-            "meshes/cube.obj",
-            Material(glm::vec3(0.8f, 0.8f, 0.8f), 0.4f, 0.2f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1, 0.0, 0.6
-            // Material(glm::vec3(0.8f, 0.8f, 0.8f), 0.15f, 0.5f,
-            // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.9
-        ),
-            glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.8f, 0.0f)), 
-                      glm::vec3(10.0f, 0.1f, 10.0f))
-        );
-        scene_->AddEntity(ground);
-    }
-
-    {
-        auto red_sphere = std::make_shared<Entity>(
-            "meshes/octahedron.obj",
-            Material(glm::vec3(0.99f, 0.97f, 0.97f), 0.20f, 0.1f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1.1, 0.98, -1, -1, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0
-
-            // Material(glm::vec3(0.95f, 0.0f, 0.0f), 0.4f, 0.1f,
-            // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0, 1.0, 0.1
-        ),
-                glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
-        );
-        scene_->AddEntity(red_sphere);
-    }
-
-    {
-        auto green_sphere = std::make_shared<Entity>(
-            "meshes/preview_sphere.obj",
-            Material(glm::vec3(0.85f, 0.85f, 0.85f), 0.05f, 0.7f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1, 0.0, 0.9, 0.1, 0.0
-                ),
-            // Material(glm::vec3(0.8f, 0.95f, 0.8f), 0.2f, 0.0f),
-                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
-        );
-        scene_->AddEntity(green_sphere);
-    }
-
-    {
-        auto blue_cube = std::make_shared<Entity>(
-            "meshes/cube.obj",
-            Material(glm::vec3(0.2f, 0.2f, 1.0f), 0.6f, 0.2f,
-            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, colorTexId, normalTexId, -1
-        ),
-            glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.5f, 0.0f))
-        );
-        scene_->AddEntity(blue_cube);
-    }
-
-    // // 色散测试
+    // // 添加实体
     // {
-    //     auto floor = std::make_shared<Entity>(
-    //         "meshes/floor.obj",
-    //         Material(
-    //             glm::vec3(0.92f, 0.92f, 0.92f), // 灰白色
-    //             0.25f,  // roughness
-    //             0.8f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.0f, 0.0f, -1, -1, -1,  // ior=1.0, transparency=0
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f  // 无特殊光学系数
-    //         ),
-    //         glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.05f, 0.0f))
+    //     int colorTexId = texture_manager_->LoadTexture("textures/grid.png");
+    //     auto ground = std::make_shared<Entity>(
+    //         "meshes/cube.obj",
+    //         Material(glm::vec3(1.0f, 0.8f, 0.88f), 0.9f, 0.0f,
+    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, colorTexId, -1, -1, 0.0, 0.6
+    //         // Material(glm::vec3(0.8f, 0.8f, 0.8f), 0.15f, 0.5f,
+    //         // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.9
+    //     ),
+    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.8f, 0.0f)), 
+    //                   glm::vec3(10.0f, 0.1f, 10.0f))
     //     );
-    //     scene_->AddEntity(floor);
+    //     scene_->AddEntity(ground);
     // }
 
-    // // 创建色散三棱柱（高透明度玻璃材质）
     // {
-    //     auto prism = std::make_shared<Entity>(
-    //         "meshes/prism.obj",
-    //         Material(
-    //             glm::vec3(1.0f),  // 基础色
-    //             0.15f,            //
-    //             0.0f,            // metallic=0
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.2f,           // 基础折射率
-    //             1.0,           // 
-    //             -1, -1, -1,      // 无纹理
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.05f,     // A系数
-    //             0.004f,  // B系数
-    //             0.011f     // C系数
-    //         ),
-    //          glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(-1.5f, 0.0f, 0.0f)),
-    //                     glm::vec3(0.5, 0.5, 0.5))
+    //     auto red_sphere = std::make_shared<Entity>(
+    //         "meshes/octahedron.obj",
+    //         Material(glm::vec3(0.99f, 0.3f, 0.2f), 0.06f, 0.4f,
+    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1.1, 0.0, -1, -1, -1, 0.0, 0.8, 0.1, 0.0, 0.0, 0.0
+
+    //         // Material(glm::vec3(0.95f, 0.0f, 0.0f), 0.4f, 0.1f,
+    //         // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0, 1.0, 0.1
+    //     ),
+    //             glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
     //     );
-    //     scene_->AddEntity(prism);
+    //     scene_->AddEntity(red_sphere);
     // }
 
-    // // 创建左侧遮光墙（z<0区域）
     // {
-    //     auto wall_left = std::make_shared<Entity>(
-    //         "meshes/wall_left.obj",
-    //         Material(
-    //             glm::vec3(0.0f, 0.0f, 0.0f), // 深灰色遮光墙
-    //             0.9f,   // roughness
-    //             0.0f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.15f),
-    //             1.0f, 0.0f, -1, -1, -1,  // 不透明
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.05f))
+    //     auto green_sphere = std::make_shared<Entity>(
+    //         "meshes/preview_sphere.obj",
+    //         Material(glm::vec3(0.85f, 0.85f, 0.85f), 0.1f, 0.7f,
+    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1, 0.0, 0.9, 0.1, 0.0
+    //             ),
+    //         // Material(glm::vec3(0.8f, 0.95f, 0.8f), 0.2f, 0.0f),
+    //             glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
     //     );
-    //     scene_->AddEntity(wall_left);
+    //     scene_->AddEntity(green_sphere);
     // }
 
-    // // 创建右侧遮光墙（z>0区域）
     // {
-    //     auto wall_right = std::make_shared<Entity>(
-    //         "meshes/wall_right.obj",
-    //         Material(
-    //             glm::vec3(0.0f),
-    //             0.9f, 0.0f, 0xFFFFFFFF,
-    //             glm::vec3(0.15f),
-    //             1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f))
+    //     auto blue_cube = std::make_shared<Entity>(
+    //         "meshes/cube.obj",
+    //         Material(glm::vec3(0.2f, 0.2f, 1.0f), 0.4f, 0.2f,
+    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1
+    //     ),
+    //         glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.5f, 0.0f))
     //     );
-    //     scene_->AddEntity(wall_right);
+    //     scene_->AddEntity(blue_cube);
     // }
 
-    // 初始化相机于观察位置
-    camera_pos_ = glm::vec3(-6.0f, 2.6f, 0.0f); // 右侧4.5米，正对场景
-    camera_up_ = glm::vec3(0.0f, 1.0f, 0.0f);
-    camera_speed_ = 0.05f;
-    yaw_ = 0.0f;  // 看向负X方向
-    pitch_ = 0.0f;
-
-    // BSDF 测试
-    // {
-    //     auto floor = std::make_shared<Entity>(
-    //         "meshes/floor.obj",
-    //         Material(
-    //             glm::vec3(0.55f, 0.65f, 0.75f), 
-    //             1.0f,  // roughness
-    //             0.0f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -3.0f, 0.0f))
-    //     );
-    //     scene_->AddEntity(floor);
-    // }
-    // {
-    //     float x = -0.5f, y = 1.0f;
-    //     auto lens = std::make_shared<Entity>(
-    //         "meshes/lens_thin.obj",
-    //         Material(
-    //             glm::vec3(0.95f, 0.9f, 1.0f), 
-    //             0.10f,  // roughness
-    //             0.00f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.05f, 1.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.5f)),
-    //                     glm::vec3(0.9))
-    //     );
-    //     scene_->AddEntity(lens);
-    // }
-    // {
-    //     float x = 0.5f, y = 1.0f;
-    //     auto lens = std::make_shared<Entity>(
-    //         "meshes/lens_thin.obj",
-    //         Material(
-    //             glm::vec3(0.95f, 0.9f, 1.0f), 
-    //             0.10f,  // roughness
-    //             0.00f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.20f, 1.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.5f)),
-    //                     glm::vec3(0.9))
-    //     );
-    //     scene_->AddEntity(lens);
-    // }
-    // {
-    //     float x = -0.5f, y = 0.0f;
-    //     auto lens = std::make_shared<Entity>(
-    //         "meshes/lens_thin.obj",
-    //         Material(
-    //             glm::vec3(0.95f, 0.9f, 1.0f), 
-    //             0.10f,  // roughness
-    //             0.00f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.35f, 1.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.5f)),
-    //                     glm::vec3(0.9))
-    //     );
-    //     scene_->AddEntity(lens);
-    // }
-    // {
-    //     float x = 0.5f, y = 0.0f;
-    //     auto lens = std::make_shared<Entity>(
-    //         "meshes/lens_thin.obj",
-    //         Material(
-    //             glm::vec3(0.95f, 0.9f, 1.0f), 
-    //             0.10f,  // roughness
-    //             0.00f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.50f, 1.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.5f)),
-    //                     glm::vec3(0.9))
-    //     );
-    //     scene_->AddEntity(lens);
-    // }
-    // {
-    //     auto back = std::make_shared<Entity>(
-    //         "meshes/square_light.obj",
-    //         Material(
-    //             glm::vec3(0.0f, 0.0f, 0.0f), 
-    //             0.6f,  // roughness
-    //             0.05f,   // metallic
-    //             0xFFFFFFFF,
-    //             glm::vec3(0.0f),
-    //             1.0f, 0.0f, colorTexId, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         ),
-    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(0.0, 0.6, -6.0f)),
-    //                     glm::vec3(7.0))
-    //     );
-    //     scene_->AddEntity(back);
-    // }
-
-    // // ========== Roughness测试列 (x=-2.5) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.3f, 0.7f, 0.9f), -2.5f,
-    //     [](float roughness) -> Material {
-    //         return Material(
-    //             glm::vec3(0.3f, 0.7f, 0.9f),
-    //             roughness,
-    //             0.3f,  // fixed metallic
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    //     // ========== Metallic测试列 (x=-1.5) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(1.0f, 0.85f, 0.6f), -1.5f,
-    //     [](float metallic) -> Material {
-    //         return Material(
-    //             glm::vec3(1.0f, 0.85f, 0.6f),
-    //             0.25f,  // fixed roughness
-    //             metallic,
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-
-    // // ========== Specular测试列 (x=-0.5) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.7f, 0.4f, 0.9f), -0.5f,
-    //     [](float specular) -> Material {
-    //         return Material(
-    //             glm::vec3(0.7f, 0.4f, 0.9f),
-    //             0.6f,  // fixed roughness
-    //             0.3f,  // fixed metallic
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, specular, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // // ========== Subsurface测试列 (x=0.5) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.95f, 0.5f, 0.4f), 0.5f,
-    //     [](float subsurface) -> Material {
-    //         return Material(
-    //             glm::vec3(0.95f, 0.5f, 0.4f),
-    //             0.5f,  // fixed roughness
-    //             0.0f,  // fixed metallic (dielectric for SSS)
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             subsurface, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // // ========== Clearcoat测试列 (x=1.5) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.3f, 0.8f, 0.5f), 1.5f,
-    //     [](float clearcoat) -> Material {
-    //         return Material(
-    //             glm::vec3(0.3f, 0.8f, 0.5f),
-    //             0.5f,  // fixed roughness
-    //             0.3f,  // fixed metallic
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, clearcoat, 0.05f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // // ========== Sheen测试列 (x=2.5) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.95f, 0.75f, 0.4f), 2.5f,
-    //     [](float sheen) -> Material {
-    //         return Material(
-    //             glm::vec3(0.95f, 0.75f, 0.4f),
-    //             0.5f,  // fixed roughness
-    //             0.3f,  // fixed metallic
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, sheen, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // ========== BSDF测试场景 - 第二组参数 ==========
-
-    // ========== IOR测试列 (x=-3.0) ==========
-    // AddIORTestColumn(scene_, glm::vec3(0.6f, 0.85f, 1.0f), -3.0f);
-
-    // ========== Transparency测试列 (x=-2.0) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.6f, 0.95f, 0.7f), -2.0f - 0.5f,
-    //     [](float transparency) -> Material {
-    //         return Material(
-    //             glm::vec3(0.65f, 0.95f, 0.75f),
-    //             0.35f,  // roughness 
-    //             0.0f,  // metallic - 电介质
-    //             0xFFFFFFFF, glm::vec3(0.0f),
-    //             1.25f,  // IOR - 玻璃
-    //             transparency,  // transparency
-    //             -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // // ========== Emission测试列 (x=-1.0) ==========
-    // AddEmissionTestColumn(scene_, glm::vec3(1.0f, 0.7f, 0.4f), -1.0f - 0.5f);
-
-    // // ========== Specular Tint测试列 (x=0.0) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.85f, 0.5f, 0.95f), 0.0f - 0.5f,
-    //     [](float specular_tint) -> Material {
-    //         return Material(
-    //             glm::vec3(0.85f, 0.5f, 0.95f),
-    //             0.3f,  // roughness
-    //             0.3f,  // metallic
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.5f, specular_tint, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // // ========== Anisotropic测试列 (x=1.0) ==========
-    // AddAnisotropicTestColumn(scene_, glm::vec3(0.4f, 0.9f, 0.7f), 1.0f - 0.5f);
-
-    // // ========== Sheen Tint测试列 (x=2.0) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(1.0f, 0.6f, 0.6f), 2.0f - 0.5f,
-    //     [](float sheen_tint) -> Material {
-    //         return Material(
-    //             glm::vec3(1.0f, 0.6f, 0.6f),
-    //             0.5f,  // roughness
-    //             0.0f,  // metallic - 非金属才能看到sheen
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.5f, sheen_tint,  // sheen=0.5, sheen_tint变化
-    //             0.0f, 0.0f,
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
-
-    // // ========== Clearcoat Roughness测试列 (x=3.0) ==========
-    // AddBSDFTestColumn(scene_, glm::vec3(0.8f, 0.7f, 1.0f), 3.0f - 0.5f,
-    //     [](float clearcoat_roughness) -> Material {
-    //         return Material(
-    //             glm::vec3(0.8f, 0.7f, 1.0f),
-    //             0.5f,  // base roughness
-    //             0.3f,  // metallic
-    //             0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-    //             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-    //             0.25f, clearcoat_roughness,  // clearcoat=0.25, roughness变化
-    //             1.0f, 0.0f, 0.0f
-    //         );
-    //     }
-    // );
+    AddLightColumnsScene(scene_);
 
     scene_->BuildAccelerationStructures();
 
@@ -1008,9 +772,21 @@ void Application::OnInit() {
     hover_info_buffer_->UploadData(&initial_hover, sizeof(HoverInfo));
 
     // 初始化相机状态
-    // camera_pos_ = glm::vec3{ 0.0f, 1.0f, 5.0f };
+    camera_pos_ = glm::vec3{ -1.7f, -0.3f, 4.50f };
+    camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
+    camera_speed_ = 0.08f;
+
+    yaw_ = -95.8f;
+    pitch_ = -26.3f;
+    // camera_pos_ = glm::vec3{ -1.4f, -0.3f, 1.3f };
     // camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
-    // camera_speed_ = 0.01f;
+    // camera_speed_ = 0.1f;
+
+    // yaw_ = -90.0f;
+    // pitch_ = 0.0f;
+    // camera_pos_ = glm::vec3{ 0.0f, 1.0f, 3.5f };
+    // camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
+    // camera_speed_ = 0.1f;
 
     // yaw_ = -90.0f;
     // pitch_ = 0.0f;
@@ -1095,7 +871,7 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_SAMPLER, 1);                 // space19 - sampler
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space20 - hdr_cdf_buffer
 
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_IMAGE, 512);                 // space21 - mip atlas images
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_IMAGE, 2048);                 // space21 - mip atlas images
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space22 - mip info buffer
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space23 - media buffer
 
@@ -1201,9 +977,9 @@ void Application::OnUpdate() {
         settings.skybox_texture_id_ = skybox_texture_id_;
         settings.resolution = glm::vec2((float)window_->GetWidth(), (float)window_->GetHeight());
         settings.global_medium_enabled = 1;
-        settings.global_sigma_a=glm::vec3(0.001f);
-        settings.global_sigma_s=glm::vec3(0.020f);
-        settings.global_Le=glm::vec3(0.0f);
+        settings.global_sigma_a=glm::vec3(0.030f);
+        settings.global_sigma_s=glm::vec3(0.200f);
+        settings.global_Le=glm::vec3(0.2, 0.5, 0.8) * 0.025f;
         
         render_settings_buffer_->UploadData(&settings, sizeof(RenderSettings));
 
@@ -1973,8 +1749,8 @@ void Application::OnRender() {
     std::vector<grassland::graphics::Image*> mip_images;
     texture_manager_->CollectMipImages(mip_images);
 
-    // 补齐到 512
-    const int maxMipImages = 512;
+    // 补齐到 2048
+    const int maxMipImages = 2048;
     if ((int)mip_images.size() < maxMipImages) {
         int pad = maxMipImages - (int)mip_images.size();
         for (int i = 0; i < pad; ++i) {

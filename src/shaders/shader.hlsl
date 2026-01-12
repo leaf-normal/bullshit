@@ -86,11 +86,13 @@ struct RenderSettings {
 
     float2 resolution;                 // width * height
     
-    int  global_medium_enabled;
+    int global_medium_enabled;
     float3 global_sigma_a;
     float3 global_sigma_s;
+    int offset;
     float3 global_Le;
 };
+
 
 ConstantBuffer<RenderSettings> render_setting : register(b0, space11);
 
@@ -135,7 +137,7 @@ SamplerState g_Sampler : register(s0, space19);
 // hdr_cdf
 StructuredBuffer<float> hdr_cdf : register(t0, space20);   // [width, height, total_luminance] + conditional_cdf + marginal_cdf
 
-Texture2D<float4> g_MipAtlas[512] : register(t0, space21);
+Texture2D<float4> g_MipAtlas[2048] : register(t0, space21);
 
 struct MipInfo{
     uint start;
@@ -161,23 +163,23 @@ struct RayPayload {
   bool is_filp;
   float4 attribute;
 
-//   RayDifferential diffs;
+  RayDifferential diffs;
 
-//   // 新增：纹理导数（u,v 对 x,y 的偏导）
-//   float dudx;
-//   float dudy;
-//   float dvdx;
-//   float dvdy;
+  // 新增：纹理导数（u,v 对 x,y 的偏导）
+  float dudx;
+  float dudy;
+  float dvdx;
+  float dvdy;
 
-//   // 新增：位置与法线微分（可选，供高级 shading 使用）
-//   float3 dpdx;
-//   float3 dpdy;
-//   float3 dndx;
-//   float3 dndy;
+  // 新增：位置与法线微分（可选，供高级 shading 使用）
+  float3 dpdx;
+  float3 dpdy;
+  float3 dndx;
+  float3 dndy;
 
-//   // 协方差 tracer 新增字段
-//   float3x3 dirCov;  // 当前方向的协方差 Cov(L)
-//   bool hasDirCov;   // 是否有效
+  // 协方差 tracer 新增字段
+  float3x3 dirCov;  // 当前方向的协方差 Cov(L)
+  bool hasDirCov;   // 是否有效
 };
 // ====================== 局部介质 ======================
 struct MediumParams{
@@ -192,14 +194,15 @@ StructuredBuffer<MediumParams> media : register(t0, space23);
 // ====================== 常量定义 ======================
 #define MAX_DEPTH 8
 #define RR_THRESHOLD 0.95f
-#define t_min 1e-3
+#define t_min 2e-3
 #define t_max 10000.0
 #define eps 5e-4 // used for geometry
 #define EPS 1e-6 // used for division
 #define PI 3.14159265359
 #define TWO_PI 6.28318530718
 #define INV_PI 0.31830988618
-#define HDR_DIS 15
+#define HDR_DIS 150
+#define MIPMAP_INTENS 1.0
 
 // from 380 nm to 780 nm, step = 5 nm
 #define SPECTRAL_SAMPLE_COUNT 81
@@ -1342,7 +1345,7 @@ bool test_shadow(float3 hit_point, float3 normal, float3 light_dir, float max_di
     MediumState medium = GetCurrentMedium();
 
     float3 sigma_t = medium.sigma_t;
-    float3 T = exp(-sigma_t * (max_distance > 1e3 ? HDR_DIS : max_distance));  // if hit hdr, use small distance
+    float3 T = exp(-sigma_t * min(max_distance, HDR_DIS));  // if hit hdr, use small distance
     transmittance = T;
     // transmittance = float3(1.0, 1.0, 1.0); 
 
@@ -1353,7 +1356,7 @@ bool test_shadow(float3 hit_point, float3 normal, float3 light_dir, float max_di
 float3 mis_direct_lighting(uint light_count, float3 hit_point, float3 normal, inout Material mat, float3 wo, bool is_flip, inout uint seed) {
     float3 total_light = float3(0, 0, 0);
 
-    if (!is_enable_lights(light_count) || (length(normal) > EPS && (mat.metallic > 0.99 || mat.clearcoat > 0.99 || mat.roughness < EPS))){
+    if (!is_enable_lights(light_count) || (length(normal) > EPS && (mat.roughness < EPS))){
         return total_light;
     }
 
@@ -1423,55 +1426,6 @@ float3 mis_direct_lighting(uint light_count, float3 hit_point, float3 normal, in
     return total_light / sample_times;
 }
 
-float IntersectRaySphere(inout RayDesc ray, inout float3 sphere_center, float sphere_radius) {
-    float3 oc = ray.Origin - sphere_center;
-    float a = dot(ray.Direction, ray.Direction);
-    float b = dot(oc, ray.Direction);
-    float c = dot(oc, oc) - sphere_radius * sphere_radius;
-    
-    float delta = b * b - a * c;  // divide 2
-    
-    if (delta < 0.0) {
-        return -1.0;
-    }
-
-    delta = sqrt(delta);
-    float t = (-b - delta) / a;
-    
-    if (t < ray.TMin) {
-        t = (-b + delta) / a;
-    }
-
-    return (t >= ray.TMin && t <= ray.TMax) ? t : -1.0;
-    
-}
-
-void CheckHitSphereLight(inout uint light_count, inout RayDesc ray, inout RayPayload payload, inout uint closest_light_idx) {
-    float closest_distance = ray.TMax;
-    closest_light_idx = 0xFFFFFFFF;
-    
-    if (payload.hit) {
-        closest_distance = length(payload.hit_point - ray.Origin);
-    }
-    
-    for (int i = 0; i < light_count; ++i) {
-        Light light = lights[i];
-        
-        if (light.type != 3 || !light.visible || !light.enabled) {
-            continue;
-        }
-        
-        float t = IntersectRaySphere(ray, light.position, light.radius);
-        
-        if (t > 0.0 && t < closest_distance) {
-            closest_distance = t;
-            closest_light_idx = i;
-            
-            payload.hit = true;
-            payload.hit_point = ray.Origin + t * ray.Direction;
-        }
-    }
-}
 // ====================== 景深辅助函数 ====================
 
 float2 concentric_sample_disk(inout uint seed) {
@@ -1530,13 +1484,13 @@ void GenerateCameraRaysWithDifferentials(
 {
     // 1. 计算像素中心与邻像素的NDC坐标
     float2 invRes = 1.0 / resolution;
-    
-    // 主像素
     float2 p_center = (float2(pixel) + pixel_sample_offset) * invRes;
-    // 右邻像素 (x+1)
-    float2 p_rx = (float2(pixel + uint2(1, 0)) + pixel_sample_offset) * invRes;
-    // 上邻像素 (y+1)
-    float2 p_ry = (float2(pixel + uint2(0, 1)) + pixel_sample_offset) * invRes;
+    float2 p_rx_raw = (float2(pixel + uint2(1, 0)) + pixel_sample_offset) * invRes;
+    float2 p_ry_raw = (float2(pixel + uint2(0, 1)) + pixel_sample_offset) * invRes;
+
+    // 2. 修改邻像素坐标：让它离中心更远或更近
+    float2 p_rx = p_center + (p_rx_raw - p_center) * MIPMAP_INTENS;
+    float2 p_ry = p_center + (p_ry_raw - p_center) * MIPMAP_INTENS;
     
     // 2. 转换到NDC [-1, 1]（注意y轴翻转）
     p_center = float2(p_center.x * 2.0 - 1.0, 1.0 - p_center.y * 2.0);
@@ -1563,25 +1517,25 @@ void GenerateCameraRaysWithDifferentials(
     
     if (camera_info.enable_depth_of_field && camera_info.lens_radius > 0.0) {
         // 计算焦平面上的点
-        // float t_focus = camera_info.focal_distance / max(-ray_dir_camera.z, EPS);
-        // float3 focal_point_camera = ray_dir_camera * t_focus;
+        float t_focus = camera_info.focal_distance / max(-ray_dir_camera.z, EPS);
+        float3 focal_point_camera = ray_dir_camera * t_focus;
         
-        // // 计算rx/ry射线在焦平面上的交点（近似处理）
-        // float t_focus_rx = camera_info.focal_distance / max(-rx_dir_camera.z, EPS);
-        // float t_focus_ry = camera_info.focal_distance / max(-ry_dir_camera.z, EPS);
-        // float3 focal_point_rx = rx_dir_camera * t_focus_rx;
-        // float3 focal_point_ry = ry_dir_camera * t_focus_ry;
+        // 计算rx/ry射线在焦平面上的交点（近似处理）
+        float t_focus_rx = camera_info.focal_distance / max(-rx_dir_camera.z, EPS);
+        float t_focus_ry = camera_info.focal_distance / max(-ry_dir_camera.z, EPS);
+        float3 focal_point_rx = rx_dir_camera * t_focus_rx;
+        float3 focal_point_ry = ry_dir_camera * t_focus_ry;
         
         // // 透镜采样（所有射线使用同一个透镜采样点，确保一致性）
         float2 lens_offset = lens_sample * camera_info.lens_radius;
         ray_origin_camera = float3(lens_offset, 0.0);
-        // rx_origin_camera = float3(lens_offset, 0.0);
-        // ry_origin_camera = float3(lens_offset, 0.0);
+        rx_origin_camera = float3(lens_offset, 0.0);
+        ry_origin_camera = float3(lens_offset, 0.0);
         
-        // // 更新光线方向（指向焦平面上的点）
-        // ray_dir_camera = normalize(focal_point_camera - ray_origin_camera);
-        // rx_dir_camera = normalize(focal_point_rx - rx_origin_camera);
-        // ry_dir_camera = normalize(focal_point_ry - ry_origin_camera);
+        // 更新光线方向（指向焦平面上的点）
+        ray_dir_camera = normalize(focal_point_camera - ray_origin_camera);
+        rx_dir_camera = normalize(focal_point_rx - rx_origin_camera);
+        ry_dir_camera = normalize(focal_point_ry - ry_origin_camera);
     } else {
         // 无DOF，所有射线从相机原点出发
         ray_origin_camera = float3(0.0, 0.0, 0.0);
@@ -1705,7 +1659,9 @@ void RayGenMain() {
     // 生成像素采样偏移（抗锯齿）
     float2 pixel_sample_offset = render_setting.enable_accumulation ? 
                                  random2(seed) : float2(0.5, 0.5);
-    
+
+    // float2 pixel_sample_offset = float2(0.5, 0.5);
+
     // 使用光线微分生成射线
     RayDesc ray;
     RayDifferential diffs;
@@ -1719,68 +1675,68 @@ void RayGenMain() {
     );
     
     // 应用相机运动模糊的时间偏移
-    // if (camera_info.enable_motion_blur) {
-    //     // 随机时间偏移（落在曝光时间范围内）
-    //     float time_offset = random(seed) * camera_info.exposure_time;
+    if (camera_info.enable_motion_blur) {
+        // 随机时间偏移（落在曝光时间范围内）
+        float time_offset = random(seed) * camera_info.exposure_time;
 
-    //     // 1) 线性位移：主射线与邻射线原点应一致地平移
-    //     float3 linear_move = camera_info.camera_linear_velocity * time_offset;
-    //     ray.Origin += linear_move;
-    //     // 注意：GenerateCameraRaysWithDifferentials 已经把 diffs.rxOrigin/ryOrigin 设置为 world-space，
-    //     // 因此这里也需要同步平移它们，保持微分一致性（以便 closesthit 能正确计算 dpdx/dpdy）。
-    //     diffs.rxOrigin += linear_move;
-    //     diffs.ryOrigin += linear_move;
+        // 1) 线性位移：主射线与邻射线原点应一致地平移
+        float3 linear_move = camera_info.camera_linear_velocity * time_offset;
+        ray.Origin += linear_move;
+        // 注意：GenerateCameraRaysWithDifferentials 已经把 diffs.rxOrigin/ryOrigin 设置为 world-space，
+        // 因此这里也需要同步平移它们，保持微分一致性（以便 closesthit 能正确计算 dpdx/dpdy）。
+        diffs.rxOrigin += linear_move;
+        diffs.ryOrigin += linear_move;
 
-    //     // 2) 角速度（绕相机本地Z轴的旋转）：
-    //     //    若角速度不为0，尽量对方向与原点都做相同的旋转（绕相机世界位置）。
-    //     float angular_offset = camera_info.camera_angular_velocity * time_offset;
-    //     if (abs(angular_offset) > 1e-8) {
-    //         float cos_theta = cos(angular_offset);
-    //         float sin_theta = sin(angular_offset);
-    //         float3x3 rotation_matrix = float3x3(
-    //             cos_theta, -sin_theta, 0.0,
-    //             sin_theta,  cos_theta, 0.0,
-    //             0.0,        0.0,       1.0
-    //         );
+        // 2) 角速度（绕相机本地Z轴的旋转）：
+        //    若角速度不为0，尽量对方向与原点都做相同的旋转（绕相机世界位置）。
+        float angular_offset = camera_info.camera_angular_velocity * time_offset;
+        if (abs(angular_offset) > 1e-8) {
+            float cos_theta = cos(angular_offset);
+            float sin_theta = sin(angular_offset);
+            float3x3 rotation_matrix = float3x3(
+                cos_theta, -sin_theta, 0.0,
+                sin_theta,  cos_theta, 0.0,
+                0.0,        0.0,       1.0
+            );
 
-    //         // 旋转方向向量（保持方向微分一致）
-    //         ray.Direction = normalize(mul(rotation_matrix, ray.Direction));
-    //         diffs.rxDirection = normalize(mul(rotation_matrix, diffs.rxDirection));
-    //         diffs.ryDirection = normalize(mul(rotation_matrix, diffs.ryDirection));
+            // 旋转方向向量（保持方向微分一致）
+            ray.Direction = normalize(mul(rotation_matrix, ray.Direction));
+            diffs.rxDirection = normalize(mul(rotation_matrix, diffs.rxDirection));
+            diffs.ryDirection = normalize(mul(rotation_matrix, diffs.ryDirection));
 
-    //         // 旋转原点：绕相机世界位置作为 pivot
-    //         float3 cam_world_pos = mul(camera_info.camera_to_world, float4(0.0, 0.0, 0.0, 1.0)).xyz;
-    //         ray.Origin = cam_world_pos + mul(rotation_matrix, ray.Origin - cam_world_pos);
-    //         diffs.rxOrigin = cam_world_pos + mul(rotation_matrix, diffs.rxOrigin - cam_world_pos);
-    //         diffs.ryOrigin = cam_world_pos + mul(rotation_matrix, diffs.ryOrigin - cam_world_pos);
-    //     }
+            // 旋转原点：绕相机世界位置作为 pivot
+            float3 cam_world_pos = mul(camera_info.camera_to_world, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+            ray.Origin = cam_world_pos + mul(rotation_matrix, ray.Origin - cam_world_pos);
+            diffs.rxOrigin = cam_world_pos + mul(rotation_matrix, diffs.rxOrigin - cam_world_pos);
+            diffs.ryOrigin = cam_world_pos + mul(rotation_matrix, diffs.ryOrigin - cam_world_pos);
+        }
 
-    //     // 3) 保守策略：启用 motion blur 时禁用基于射线微分的 adaptive mipmap
-    //     //    （ClosestHitMain 已根据 payload.diffs.hasDifferentials 决定是否使用微分）
-    //     diffs.hasDifferentials = false;
-    // }    
+        // 3) 保守策略：启用 motion blur 时禁用基于射线微分的 adaptive mipmap
+        //    （ClosestHitMain 已根据 payload.diffs.hasDifferentials 决定是否使用微分）
+        diffs.hasDifferentials = false;
+    }    
 
     // === 协方差初始化 ===
     float3x3 dirCov = (float3x3)0;
     bool hasDirCov = diffs.hasDifferentials;
-    // if (hasDirCov) {
-    //     float3 v      = ray.Direction;
-    //     float3 dv_dx  = diffs.rxDirection - v;
-    //     float3 dv_dy  = diffs.ryDirection - v;
+    if (hasDirCov) {
+        float3 v      = ray.Direction;
+        float3 dv_dx  = diffs.rxDirection - v;
+        float3 dv_dy  = diffs.ryDirection - v;
 
-    //     // Cov_L = dv_dx dv_dx^T + dv_dy dv_dy^T
-    //     dirCov[0][0] = dv_dx.x * dv_dx.x + dv_dy.x * dv_dy.x;
-    //     dirCov[0][1] = dv_dx.x * dv_dx.y + dv_dy.x * dv_dy.y;
-    //     dirCov[0][2] = dv_dx.x * dv_dx.z + dv_dy.x * dv_dy.z;
+        // Cov_L = dv_dx dv_dx^T + dv_dy dv_dy^T
+        dirCov[0][0] = dv_dx.x * dv_dx.x + dv_dy.x * dv_dy.x;
+        dirCov[0][1] = dv_dx.x * dv_dx.y + dv_dy.x * dv_dy.y;
+        dirCov[0][2] = dv_dx.x * dv_dx.z + dv_dy.x * dv_dy.z;
 
-    //     dirCov[1][0] = dv_dx.y * dv_dx.x + dv_dy.y * dv_dy.x;
-    //     dirCov[1][1] = dv_dx.y * dv_dx.y + dv_dy.y * dv_dy.y;
-    //     dirCov[1][2] = dv_dx.y * dv_dx.z + dv_dy.y * dv_dy.z;
+        dirCov[1][0] = dv_dx.y * dv_dx.x + dv_dy.y * dv_dy.x;
+        dirCov[1][1] = dv_dx.y * dv_dx.y + dv_dy.y * dv_dy.y;
+        dirCov[1][2] = dv_dx.y * dv_dx.z + dv_dy.y * dv_dy.z;
 
-    //     dirCov[2][0] = dv_dx.z * dv_dx.x + dv_dy.z * dv_dy.x;
-    //     dirCov[2][1] = dv_dx.z * dv_dx.y + dv_dy.z * dv_dy.y;
-    //     dirCov[2][2] = dv_dx.z * dv_dx.z + dv_dy.z * dv_dy.z;
-    // }
+        dirCov[2][0] = dv_dx.z * dv_dx.x + dv_dy.z * dv_dy.x;
+        dirCov[2][1] = dv_dx.z * dv_dx.y + dv_dy.z * dv_dy.y;
+        dirCov[2][2] = dv_dx.z * dv_dx.z + dv_dy.z * dv_dy.z;
+    }
 
     diffs.hasDifferentials = false; // 暂不启用
     hasDirCov = false;
@@ -1819,28 +1775,40 @@ void RayGenMain() {
 
         RayPayload payload;
         payload.attribute = float4(-1.0,-1.0,-1.0,-1.0);
-        // payload.diffs = diffs;
-        // payload.dirCov   = dirCov;
-        // payload.hasDirCov = hasDirCov;
+        payload.diffs = diffs;
+        payload.dirCov   = dirCov;
+        payload.hasDirCov = hasDirCov;
 
         TraceRay(as, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
+
+        // color = payload.color;
+        // if(render_setting.enable_accumulation){
+        //     break;
+        // }
+
         // Traceray(ray, payload, 0);
 
-        CheckHitSphereLight(light_count, ray, payload, light_idx);
+        float3 wo = -ray.Direction;
 
         Material mat;
         MediumState medium = GetCurrentMedium();
         float surface_dist = HDR_DIS;
 
         if (payload.hit) {
-            surface_dist = length(payload.hit_point - ray.Origin);
+            surface_dist = min(surface_dist, length(payload.hit_point - ray.Origin));
         }
-        bool medium_has_ext = (medium.enabled && (medium.sigma_t.x > 0.0 || medium.sigma_t.y > 0.0 || medium.sigma_t.z > 0.0));
-
-        bool scatter_in_medium = false;
-        float t_medium = 0.0f;
+        // else{
+        //     surface_dist = 8;
+        // }
+        bool medium_has_ext = (render_setting.enable_accumulation && medium.enabled && (medium.sigma_t.x > 0.0 || medium.sigma_t.y > 0.0 || medium.sigma_t.z > 0.0));
 
         if (medium_has_ext) {
+            bool scatter_in_medium = false;
+            float t_medium = 0.0f;
+
+            diffs.hasDifferentials = false;
+            hasDirCov = false;
+
             int channel_idx = min((int)(random(seed) * 3.0), 2); // 0, 1, or 2
 
             t_medium = -log(max(random(seed), 1e-6)) / medium.sigma_t[channel_idx];
@@ -1900,34 +1868,38 @@ void RayGenMain() {
             }
         }
 
-        if(light_idx == 0xFFFFFFFF){
-            if (!payload.hit) {
-                if(render_setting.skybox_texture_id_ >= 0){
-                    light_idx = light_count;
-                }
-                else{ // no hdr
-                    if(enable_dispersion){
-                        payload.color = GetSpectralAlbedo(payload.color, wave_weight);
-                    }
-                    color += payload.color * throughput;
-                    break;
-                }
+        light_idx = 0xFFFFFFFF;
+        if (!payload.hit) {
+            if(render_setting.skybox_texture_id_ >= 0){
+                light_idx = light_count;
             }
-            else{
-                // 记录首次命中的实体ID
-                if (depth == 0) {
-                    entity_id_output[pixel_coords] = (int)payload.instance_id;
+            else{ // no hdr
+                if(enable_dispersion){
+                    payload.color = GetSpectralAlbedo(payload.color, wave_weight);
                 }
-                mat = materials[payload.instance_id];
-                light_idx = mat.light_index;
+                color += payload.color * throughput;
+                break;
             }
-            mat.base_color = payload.color;
-            if(payload.attribute.r>=-EPS) 
-            {
-                mat.roughness = payload.attribute.r;
-                mat.specular = payload.attribute.g;
-                mat.metallic = payload.attribute.b;
-                mat.roughness = payload.attribute.a;
+        }
+        else{
+            // 记录首次命中的实体ID
+            if (depth == 0) {
+                entity_id_output[pixel_coords] = (int)payload.instance_id;
+            }
+            mat = materials[payload.instance_id];
+            light_idx = mat.light_index;
+        }
+        mat.base_color = payload.color;
+
+        if(payload.attribute.r>=-EPS) 
+        {
+            mat.roughness = payload.attribute.r;
+            mat.specular = payload.attribute.g;
+            mat.metallic = payload.attribute.b;
+            mat.transparency = 1.0 - payload.attribute.a;
+            if(mat.transparency > 0.9){
+                mat.base_color = 1.0;
+                mat.roughness = 0.0;
             }
         }
 
@@ -1935,8 +1907,6 @@ void RayGenMain() {
             mat.ior = GetCauchyIOR(wavelength_nm, mat.A, mat.B, mat.C);
             mat.base_color = GetSpectralAlbedo(mat.base_color, wave_weight);
         }
-
-        float3 wo = -ray.Direction;
         
         // 处理光源命中
         if (light_idx != 0xFFFFFFFF) {
@@ -2012,7 +1982,8 @@ void RayGenMain() {
             if(enable_dispersion){
                 mat.emission = GetSpectralAlbedo(mat.emission, wave_weight);
             }
-            color += mat.emission * throughput;
+            // color += mat.emission * throughput;
+            color += mat.emission * throughput * (0.8 + abs(dot(payload.normal, ray.Direction)) * 0.3);
         }
         
         // 俄罗斯轮盘赌终止
@@ -2026,7 +1997,7 @@ void RayGenMain() {
         float3 wi = float3(0.0, 0.0, 0.0);
         float pdf;
         float3 bsdf_val;
-        if (mat.roughness < EPS) { // 绕过 BSDF
+        if (mat.roughness < EPS) { // 绕过 BSDF，只能是理想镜面或理想玻璃
             // 1. 计算菲涅尔系数 F
             float F0_ior = pow((mat.ior - 1.0) / (mat.ior + 1.0), 2.0);
             float3 F0 = lerp(float3(F0_ior, F0_ior, F0_ior), mat.base_color, mat.metallic);
@@ -2086,7 +2057,7 @@ void RayGenMain() {
             bsdf_val = EvalBSDF(mat, wo, wi, payload.normal, payload.is_filp, pdf);
 
             if(isinf(pdf) || isnan(pdf)){
-              color = float3(1e9, 0.0, isnan(pdf)? 1e9: 0);
+            //   color = float3(1e9, 0.0, isnan(pdf)? 1e9: 0);
               break;
             }
         }
@@ -2101,7 +2072,7 @@ void RayGenMain() {
         bsdf_val *= cos_theta / pdf;
 
         // prevent extreme cases
-        if (pdf < 2e-5 || f3_max(bsdf_val) > 1e3) {
+        if (pdf < 1e-5 || f3_max(bsdf_val) > 1e3) {
             break;
         } 
         // if (pdf < 2e-6 || f3_max(bsdf_val) > 5e3) {
@@ -2111,126 +2082,126 @@ void RayGenMain() {
         throughput *= bsdf_val; // bsdf_val modified above
         // throughput = max(throughput, float3(0.0, 0.0, 0.0));
 
-        // if (mat.roughness > 0.6 && mat.metallic < 0.2 && mat.transparency < 0.2) {
-        //     diffs.hasDifferentials = false;
-        //     hasDirCov = false;
-        // }
+        if (mat.roughness > 0.6 && mat.metallic < 0.2 && mat.transparency < 0.2) {
+            diffs.hasDifferentials = false;
+            hasDirCov = false;
+        }
 
-        // // 如果弹跳太深，也可以停掉
-        // if (depth > 4) {
-        //     diffs.hasDifferentials = false;
-        //     hasDirCov = false;            
-        // }
+        // 如果弹跳太深，也可以停掉
+        if (depth > 4) {
+            diffs.hasDifferentials = false;
+            hasDirCov = false;            
+        }
 
-        // if (diffs.hasDifferentials)
-        // {
-        //     float3 v_in = ray.Direction;
+        if (diffs.hasDifferentials)
+        {
+            float3 v_in = ray.Direction;
 
-        //     float3 dv_dx = diffs.rxDirection - v_in;
-        //     float3 dv_dy = diffs.ryDirection - v_in;
+            float3 dv_dx = diffs.rxDirection - v_in;
+            float3 dv_dy = diffs.ryDirection - v_in;
 
-        //     float3 dn_dx = payload.dndx;
-        //     float3 dn_dy = payload.dndy;
+            float3 dn_dx = payload.dndx;
+            float3 dn_dy = payload.dndy;
 
-        //     float NdotV = dot(payload.normal, wo);
-        //     float NdotL = dot(payload.normal, wi);
-        //     bool is_trans = (NdotV * NdotL) < 0.0;
+            float NdotV = dot(payload.normal, wo);
+            float NdotL = dot(payload.normal, wi);
+            bool is_trans = (NdotV * NdotL) < 0.0;
 
-        //     float3 dwo_dx = 0.0;
-        //     float3 dwo_dy = 0.0;
+            float3 dwo_dx = 0.0;
+            float3 dwo_dy = 0.0;
 
 
-        //     // === 3.2 微法线协方差 Cov_h（与 anisotropic GGX 一致） ===
-        //     float3 T, B;
-        //     GetTangent(payload.normal, T, B);
+            // === 3.2 微法线协方差 Cov_h（与 anisotropic GGX 一致） ===
+            float3 T, B;
+            GetTangent(payload.normal, T, B);
 
-        //     float alpha = mat.roughness * mat.roughness;
-        //     float aspect = sqrt(max(1.0 - 0.9 * mat.anisotropic, EPS));
-        //     float ax = max(EPS, alpha / aspect);
-        //     float ay = max(EPS, alpha * aspect);
+            float alpha = mat.roughness * mat.roughness;
+            float aspect = sqrt(max(1.0 - 0.9 * mat.anisotropic, EPS));
+            float ax = max(EPS, alpha / aspect);
+            float ay = max(EPS, alpha * aspect);
 
-        //     float3x3 Cov_in = payload.dirCov;
-        //     float3x3 Cov_h = MicroNormalCovariance_Aniso(
-        //         T, B, ax, ay
-        //     );
+            float3x3 Cov_in = payload.dirCov;
+            float3x3 Cov_h = MicroNormalCovariance_Aniso(
+                T, B, ax, ay
+            );
 
-        //     // === 3.3 选择反射/折射的 Jacobian ===
-        //     float3x3 J_L_v;
-        //     float3x3 J_L_n;
+            // === 3.3 选择反射/折射的 Jacobian ===
+            float3x3 J_L_v;
+            float3x3 J_L_n;
 
-        //     if (!is_trans)
-        //     {
-        //         // 反射
-        //         J_L_v = ReflectionJacobian_wrt_Dir(v_in, payload.normal);
-        //         J_L_n = ReflectionJacobian_wrt_Normal(v_in, payload.normal);
+            if (!is_trans)
+            {
+                // 反射
+                J_L_v = ReflectionJacobian_wrt_Dir(v_in, payload.normal);
+                J_L_n = ReflectionJacobian_wrt_Normal(v_in, payload.normal);
 
-        //         dwo_dx = float3(
-        //             dot(J_L_v[0], dv_dx) + dot(J_L_n[0], dn_dx),
-        //             dot(J_L_v[1], dv_dx) + dot(J_L_n[1], dn_dx),
-        //             dot(J_L_v[2], dv_dx) + dot(J_L_n[2], dn_dx)
-        //         );
-        //         dwo_dy = float3(
-        //             dot(J_L_v[0], dv_dy) + dot(J_L_n[0], dn_dy),
-        //             dot(J_L_v[1], dv_dy) + dot(J_L_n[1], dn_dy),
-        //             dot(J_L_v[2], dv_dy) + dot(J_L_n[2], dn_dy)
-        //         );
-        //     }
-        //     else
-        //     {
-        //         // 折射
-        //         float eta = (!payload.is_filp) ? (1.0 / mat.ior) : mat.ior;
+                dwo_dx = float3(
+                    dot(J_L_v[0], dv_dx) + dot(J_L_n[0], dn_dx),
+                    dot(J_L_v[1], dv_dx) + dot(J_L_n[1], dn_dx),
+                    dot(J_L_v[2], dv_dx) + dot(J_L_n[2], dn_dx)
+                );
+                dwo_dy = float3(
+                    dot(J_L_v[0], dv_dy) + dot(J_L_n[0], dn_dy),
+                    dot(J_L_v[1], dv_dy) + dot(J_L_n[1], dn_dy),
+                    dot(J_L_v[2], dv_dy) + dot(J_L_n[2], dn_dy)
+                );
+            }
+            else
+            {
+                // 折射
+                float eta = (!payload.is_filp) ? (1.0 / mat.ior) : mat.ior;
 
-        //         J_L_v = RefractionJacobian_wrt_Dir(v_in, payload.normal, eta);
-        //         J_L_n = RefractionJacobian_wrt_Normal(v_in, payload.normal, eta);
+                J_L_v = RefractionJacobian_wrt_Dir(v_in, payload.normal, eta);
+                J_L_n = RefractionJacobian_wrt_Normal(v_in, payload.normal, eta);
 
-        //         dwo_dx = float3(
-        //             dot(J_L_v[0], dv_dx) + dot(J_L_n[0], dn_dx),
-        //             dot(J_L_v[1], dv_dx) + dot(J_L_n[1], dn_dx),
-        //             dot(J_L_v[2], dv_dx) + dot(J_L_n[2], dn_dx)
-        //         );
-        //         dwo_dy = float3(
-        //             dot(J_L_v[0], dv_dy) + dot(J_L_n[0], dn_dy),
-        //             dot(J_L_v[1], dv_dy) + dot(J_L_n[1], dn_dy),
-        //             dot(J_L_v[2], dv_dy) + dot(J_L_n[2], dn_dy)
-        //         );
-        //     }
+                dwo_dx = float3(
+                    dot(J_L_v[0], dv_dx) + dot(J_L_n[0], dn_dx),
+                    dot(J_L_v[1], dv_dx) + dot(J_L_n[1], dn_dx),
+                    dot(J_L_v[2], dv_dx) + dot(J_L_n[2], dn_dx)
+                );
+                dwo_dy = float3(
+                    dot(J_L_v[0], dv_dy) + dot(J_L_n[0], dn_dy),
+                    dot(J_L_v[1], dv_dy) + dot(J_L_n[1], dn_dy),
+                    dot(J_L_v[2], dv_dy) + dot(J_L_n[2], dn_dy)
+                );
+            }
 
-        //     // === 3.4 协方差递推：Cov_out = J_L_v Cov_in J_L_v^T + J_L_n Cov_h J_L_n^T ===
-        //     if (payload.hasDirCov)
-        //     {
-        //         float3x3 Cov_geom  = PropagateNormalCovToDirectionCov(J_L_v, Cov_in);
-        //         float3x3 Cov_micro = PropagateNormalCovToDirectionCov(J_L_n, Cov_h);
+            // === 3.4 协方差递推：Cov_out = J_L_v Cov_in J_L_v^T + J_L_n Cov_h J_L_n^T ===
+            if (payload.hasDirCov)
+            {
+                float3x3 Cov_geom  = PropagateNormalCovToDirectionCov(J_L_v, Cov_in);
+                float3x3 Cov_micro = PropagateNormalCovToDirectionCov(J_L_n, Cov_h);
 
-        //         dirCov = Cov_geom + Cov_micro;  // 真正的 Cov_out
+                dirCov = Cov_geom + Cov_micro;  // 真正的 Cov_out
 
-        //         // 可选：trace 限制，防止爆炸
-        //         float trace = dirCov[0][0] + dirCov[1][1] + dirCov[2][2];
-        //         float maxTrace = 10.0; // 可按场景微调
-        //         if (trace > maxTrace) {
-        //             float scale = maxTrace / max(trace, EPS);
-        //             dirCov *= scale;
-        //         }
-        //         hasDirCov = true;
-        //     }
+                // 可选：trace 限制，防止爆炸
+                float trace = dirCov[0][0] + dirCov[1][1] + dirCov[2][2];
+                float maxTrace = 10.0; // 可按场景微调
+                if (trace > maxTrace) {
+                    float scale = maxTrace / max(trace, EPS);
+                    dirCov *= scale;
+                }
+                hasDirCov = true;
+            }
 
-        //     // === 3.5 用 dwo_dx/dwo_dy 更新 ray differentials ===
+            // === 3.5 用 dwo_dx/dwo_dy 更新 ray differentials ===
 
-        //     diffs.rxDirection = normalize(wi + dwo_dx);
-        //     diffs.ryDirection = normalize(wi + dwo_dy);
+            diffs.rxDirection = normalize(wi + dwo_dx);
+            diffs.ryDirection = normalize(wi + dwo_dy);
 
-        //     diffs.rxOrigin = payload.hit_point + payload.dpdx;
-        //     diffs.ryOrigin = payload.hit_point + payload.dpdy;
-        // }
+            diffs.rxOrigin = payload.hit_point + payload.dpdx;
+            diffs.ryOrigin = payload.hit_point + payload.dpdy;
+        }
         
         
         // 记录用于MIS的数据
         prev_bsdf_pdf = pdf;
         
-        prev_is_specular = (mat.metallic > 0.99 || mat.clearcoat > 0.99 || mat.roughness < EPS); // simplified
+        prev_is_specular = (mat.roughness < EPS); // simplified
         
         // 准备下一次光线
         ray.Origin = payload.hit_point + payload.normal * eps;
-        ray.Direction = normalize(wi);
+        ray.Direction = wi;
         ray.TMin = t_min;
         ray.TMax = t_max;
     }
@@ -2246,11 +2217,12 @@ void RayGenMain() {
         accumulated_samples[pixel_coords] = prev_samples + 1;
         if(enable_dispersion){
             color = color.x * wave_weight * 3.0 / (wave_weight.x + wave_weight.y + wave_weight.z); // consider pdf
-            accumulated_color[pixel_coords] = prev_color + float4(color, 1);
         }
-        else{
-            accumulated_color[pixel_coords] = prev_color + float4(color, 1);
+        if(prev_samples >= 1){  // 自适应降噪
+            color = min(color, max(prev_color.xyz / prev_samples * 400, 180.0));
         }
+
+        accumulated_color[pixel_coords] = prev_color + float4(color, 1);
     }
 }
 
@@ -2276,48 +2248,50 @@ void MissMain(inout RayPayload payload) {
         v = clamp(v, 0.0, 1.0);
         
         float lod = 0.0;
-        // if (payload.hasDirCov) {
-        //     float2x2 CovUV;
-        //     DirectionCovToLatLongUVCov(normalizedDir, payload.dirCov, CovUV);
+        if (payload.hasDirCov) {
+            float2x2 CovUV;
+            DirectionCovToLatLongUVCov(normalizedDir, payload.dirCov, CovUV);
 
-        //     float2 axis_len;
-        //     float2x2 cov_texel;
-        //     lod = ComputeEnvmapLOD_FromCovUV(
-        //         render_setting.skybox_texture_id_, CovUV,
-        //         axis_len, cov_texel
-        //     );
+            float2 axis_len;
+            float2x2 cov_texel;
+            lod = ComputeEnvmapLOD_FromCovUV(
+                render_setting.skybox_texture_id_, CovUV,
+                axis_len, cov_texel
+            );
 
-        //     lod = clamp(lod, 0.0, 10.0);
-        // }
+            lod = clamp(lod, 0.0, 10.0);
+        }
 
         payload.color = SampleTexture2D_Lod(render_setting.skybox_texture_id_, float2(u,v), lod).rgb;
         // payload.color = g_Textures[render_setting.skybox_texture_id_].SampleLevel(g_Sampler, float2(u, v), 0).rgb;
     } else {
         // 简化的天空渐变（原有的）
         float t = 0.5 * (normalize(WorldRayDirection()).y + 1.0);
-        payload.color = lerp(float3(0.5, 0.5, 0.5), float3(1.0, 1.0, 1.0) * 0.8, t) * 0.1;
+        // 底部：深青色 (0.0, 0.7, 0.8)
+        // 顶部：淡粉色 (1.0, 0.75, 0.8)
+        payload.color = lerp(float3(0.0, 0.7, 0.8), float3(1.0, 0.75, 0.8), t * 1.3) * 1.2;
     }
 }
 
 
-// // ========================== Adaptive mipmap 法线差分 ====================================
+// ========================== Adaptive mipmap 法线差分 ====================================
 
-// // 计算用于 SampleLevel 的 LOD
-// float ComputeTextureLOD(Texture2D<float4> tex,
-//                         float dudx, float dudy, float dvdx, float dvdy)
-// {
-//     uint w, h;
-//     tex.GetDimensions(w, h);
-//     // 把 uv 导数转换到 texel 空间
-//     float2 dx = float2(dudx * (float)w, dvdx * (float)h);
-//     float2 dy = float2(dudy * (float)w, dvdy * (float)h);
-//     float rho2 = max(dot(dx, dx), dot(dy, dy));
-//     // 防止 log2(0)
-//     rho2 = max(rho2, 1e-8);
-//     float lod = 0.5 * log2(rho2);
-//     if (lod < 0.0) lod = 0.0;
-//     return lod;
-// }
+// 计算用于 SampleLevel 的 LOD
+float ComputeTextureLOD(Texture2D<float4> tex,
+                        float dudx, float dudy, float dvdx, float dvdy)
+{
+    uint w, h;
+    tex.GetDimensions(w, h);
+    // 把 uv 导数转换到 texel 空间
+    float2 dx = float2(dudx * (float)w, dvdx * (float)h);
+    float2 dy = float2(dudy * (float)w, dvdy * (float)h);
+    float rho2 = max(dot(dx, dx), dot(dy, dy));
+    // 防止 log2(0)
+    rho2 = max(rho2, 1e-8);
+    float lod = 0.5 * log2(rho2);
+    if (lod < 0.0) lod = 0.0;
+    return lod;
+}
 
 // // --- 1.1 计算三角形切线/副切线（per-triangle, constant） ---
 // // 返回 true 表示成功（UV 矩阵非退化），并输出 tangent, bitangent（未归一化后可 normalize）
@@ -2348,377 +2322,342 @@ void MissMain(inout RayPayload payload) {
 //     return true;
 // }
 
-// // --- 1.2 顶点法线插值导数（barycentric 导数法） ---
-// // ---------------------------------------------------------------------------
-// // 推荐实现：ComputeSmoothNormalDerivatives_Triangle
-// // 说明：
-// //  - 采用你约定的重心对应关系：u = w0 = attr.barycentrics.x 对应 v1，
-// //    v = w1 = attr.barycentrics.y 对应 v2，v0 权重为 (1-u-v)。
-// //  - 需要保证传入的 E1,E2,dpdx,dpdy,n0,n1,n2 都处于同一坐标系（通常 world space）。
-// //  - 依赖 SolveForCoeffs3x2(E1,E2, dp) -> float2(a,b)（得到 a=∂u/∂x, b=∂v/∂x）。
-// // ---------------------------------------------------------------------------
-// void ComputeSmoothNormalDerivatives_Triangle(
-//     float3 n0, float3 n1, float3 n2,    // 顶点法线 (同一坐标系)
-//     float3 E1, float3 E2,              // E1 = v1 - v0, E2 = v2 - v0 (同一坐标系)
-//     float2 bary,                       // bary.x = w0 (=u, 对应 v1), bary.y = w1 (=v, 对应 v2)
-//     float3 dpdx, float3 dpdy,          // 屏幕空间到三维空间的微分 (同一坐标系)
-//     out float3 dndx, out float3 dndy,  // 输出：平滑法线在屏幕 x,y 的导数（world-space）
-//     out float3 n_shading)              // 输出：插值后（未受 normal-map 影响）的 shading normal（已归一化）
-// {
-//     // 1) 计算 shading normal（按你的重心约定）
-//     float u = bary.x;
-//     float v = bary.y;
-//     float w = 1.0 - u - v;            // 对应 v0 的权重
-//     // 线性插值并归一化
-//     float3 n_interp = u * n1 + v * n2 + w * n0;
-//     float lenN = length(n_interp);
-//     if (lenN < EPS) {
-//         // 极端退化：使用面法线近似（E1 x E2）
-//         n_shading = normalize(cross(E1, E2));
-//         if (length(n_shading) < EPS) {
-//             // 彻底退化：任取一个轴
-//             n_shading = float3(0.0, 0.0, 1.0);
-//         }
-//     } else {
-//         n_shading = normalize(n_interp);
-//     }
+// --- 1.2 顶点法线插值导数（barycentric 导数法） ---
+// ---------------------------------------------------------------------------
+// 推荐实现：ComputeSmoothNormalDerivatives_Triangle
+// 说明：
+//  - 采用你约定的重心对应关系：u = w0 = attr.barycentrics.x 对应 v1，
+//    v = w1 = attr.barycentrics.y 对应 v2，v0 权重为 (1-u-v)。
+//  - 需要保证传入的 E1,E2,dpdx,dpdy,n0,n1,n2 都处于同一坐标系（通常 world space）。
+//  - 依赖 SolveForCoeffs3x2(E1,E2, dp) -> float2(a,b)（得到 a=∂u/∂x, b=∂v/∂x）。
+// ---------------------------------------------------------------------------
+void ComputeSmoothNormalDerivatives_Triangle(
+    float3 n0, float3 n1, float3 n2,    // 顶点法线 (同一坐标系)
+    float3 E1, float3 E2,              // E1 = v1 - v0, E2 = v2 - v0 (同一坐标系)
+    float2 bary,                       // bary.x = w0 (=u, 对应 v1), bary.y = w1 (=v, 对应 v2)
+    float3 dpdx, float3 dpdy,          // 屏幕空间到三维空间的微分 (同一坐标系)
+    out float3 dndx, out float3 dndy,  // 输出：平滑法线在屏幕 x,y 的导数（world-space）
+    out float3 n_shading)              // 输出：插值后（未受 normal-map 影响）的 shading normal（已归一化）
+{
+    // 1) 计算 shading normal（按你的重心约定）
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;            // 对应 v0 的权重
+    // 线性插值并归一化
+    float3 n_interp = u * n1 + v * n2 + w * n0;
+    float lenN = length(n_interp);
+    if (lenN < EPS) {
+        // 极端退化：使用面法线近似（E1 x E2）
+        n_shading = normalize(cross(E1, E2));
+        if (length(n_shading) < EPS) {
+            // 彻底退化：任取一个轴
+            n_shading = float3(0.0, 0.0, 1.0);
+        }
+    } else {
+        n_shading = normalize(n_interp);
+    }
 
-//     // 2) 计算法线对局部参数 u,v 的偏导：对线性重心插值有解析表达
-//     //    ∂n/∂u = n1 - n0 ;  ∂n/∂v = n2 - n0
-//     float3 dn_du = n1 - n0;
-//     float3 dn_dv = n2 - n0;
+    // 2) 计算法线对局部参数 u,v 的偏导：对线性重心插值有解析表达
+    //    ∂n/∂u = n1 - n0 ;  ∂n/∂v = n2 - n0
+    float3 dn_du = n1 - n0;
+    float3 dn_dv = n2 - n0;
 
-//     // 3) 使用 SolveForCoeffs3x2 求解 dpdx = a*E1 + b*E2 （a = ∂u/∂x, b = ∂v/∂x）
-//     //    并同理求出 ∂u/∂y, ∂v/∂y
-//     float2 ab_dx = SolveForCoeffs3x2(E1, E2, dpdx); // returns (a_dx, b_dx)
-//     float2 ab_dy = SolveForCoeffs3x2(E1, E2, dpdy); // returns (a_dy, b_dy)
+    // 3) 使用 SolveForCoeffs3x2 求解 dpdx = a*E1 + b*E2 （a = ∂u/∂x, b = ∂v/∂x）
+    //    并同理求出 ∂u/∂y, ∂v/∂y
+    float2 ab_dx = SolveForCoeffs3x2(E1, E2, dpdx); // returns (a_dx, b_dx)
+    float2 ab_dy = SolveForCoeffs3x2(E1, E2, dpdy); // returns (a_dy, b_dy)
 
-//     // 4) 使用链式法则得到 dndx, dndy
-//     //    dndx = (∂n/∂u) * (∂u/∂x) + (∂n/∂v) * (∂v/∂x)
-//     dndx = dn_du * ab_dx.x + dn_dv * ab_dx.y;
-//     dndy = dn_du * ab_dy.x + dn_dv * ab_dy.y;
+    // 4) 使用链式法则得到 dndx, dndy
+    //    dndx = (∂n/∂u) * (∂u/∂x) + (∂n/∂v) * (∂v/∂x)
+    dndx = dn_du * ab_dx.x + dn_dv * ab_dx.y;
+    dndy = dn_du * ab_dy.x + dn_dv * ab_dy.y;
 
-//     // 5) 数值保护（可选）：如果 dp 很小导致 ab_* 都几乎为 0，则保持 dndx/dndy 为 0
-//     //    （上述计算已自然返回 0，若需要可在此 clamp）
-// }
+    // 5) 数值保护（可选）：如果 dp 很小导致 ab_* 都几乎为 0，则保持 dndx/dndy 为 0
+    //    （上述计算已自然返回 0，若需要可在此 clamp）
+}
 
-// void ComputeNormalMapDerivatives_WithCustomLOD(
-//     int id,
-//     float2 uv,
-//     float dudx, float dudy, float dvdx, float dvdy,
-//     float custom_lod, // 自定义LOD值
-//     out float3 n_t, out float3 dntdx, out float3 dntdy)
-// {
-//     // 1) 采样中心像素
-//     float4 c = SampleTexture2D_Lod(id, uv, custom_lod);
-//     float3 sC = c.xyz;
-//     float3 nc = sC * 2.0 - 1.0;
-//     n_t = normalize(nc);
+void ComputeNormalMapDerivatives_WithCustomLOD(
+    int id,
+    float2 uv,
+    float dudx, float dudy, float dvdx, float dvdy,
+    float custom_lod, // 自定义LOD值
+    out float3 n_t, out float3 dntdx, out float3 dntdy)
+{
+    // 1) 采样中心像素
+    float4 c = SampleTexture2D_Lod(id, uv, custom_lod);
+    float3 sC = c.xyz;
+    float3 nc = sC * 2.0 - 1.0;
+    n_t = normalize(nc);
 
-//     // 2) 获取当前mip级别的纹理尺寸
-//     uint w, h;
-//     g_Textures[id].GetDimensions(w, h);
+    // 2) 获取当前mip级别的纹理尺寸
+    uint w, h;
+    g_Textures[id].GetDimensions(w, h);
     
-//     // 3) 根据自定义LOD计算相邻像素的偏移
-//     float mip_scale = exp2(custom_lod);
-//     float2 texel = 1.0 / float2(max(1u, w), max(1u, h)) * mip_scale;
+    // 3) 根据自定义LOD计算相邻像素的偏移
+    float mip_scale = exp2(custom_lod);
+    float2 texel = 1.0 / float2(max(1u, w), max(1u, h)) * mip_scale;
     
-//     // 4) 采样相邻像素用于中心差分
-//     float4 su = SampleTexture2D_Lod(id, uv + float2(texel.x, 0.0), custom_lod);
-//     float4 su_m = SampleTexture2D_Lod(id, uv - float2(texel.x, 0.0), custom_lod);
-//     float4 sv = SampleTexture2D_Lod(id, uv + float2(0.0, texel.y), custom_lod);
-//     float4 sv_m = SampleTexture2D_Lod(id, uv - float2(0.0, texel.y), custom_lod);
+    // 4) 采样相邻像素用于中心差分
+    float4 su = SampleTexture2D_Lod(id, uv + float2(texel.x, 0.0), custom_lod);
+    float4 su_m = SampleTexture2D_Lod(id, uv - float2(texel.x, 0.0), custom_lod);
+    float4 sv = SampleTexture2D_Lod(id, uv + float2(0.0, texel.y), custom_lod);
+    float4 sv_m = SampleTexture2D_Lod(id, uv - float2(0.0, texel.y), custom_lod);
 
-//     // 5) 计算导数
-//     float3 dn_du = (su.xyz - su_m.xyz) / texel.x;
-//     float3 dn_dv = (sv.xyz - sv_m.xyz) / texel.y;
+    // 5) 计算导数
+    float3 dn_du = (su.xyz - su_m.xyz) / texel.x;
+    float3 dn_dv = (sv.xyz - sv_m.xyz) / texel.y;
 
-//     // 6) 链式法则转换到屏幕空间
-//     dntdx = dn_du * dudx + dn_dv * dvdx;
-//     dntdy = dn_du * dudy + dn_dv * dvdy;
-// }
+    // 6) 链式法则转换到屏幕空间
+    dntdx = dn_du * dudx + dn_dv * dvdx;
+    dntdy = dn_du * dudy + dn_dv * dvdy;
+}
 
-// // 综合：计算最终 world-space 法线导数并写入 payload.dndx/dndy
-// // 参数：
-// //   v0,v1,v2: triangle positions
-// //   n0,n1,n2: vertex normals (shading normals)
-// //   uv0,uv1,uv2: vertex uvs
-// //   bary: (attr.barycentrics.x, attr.barycentrics.y)
-// //   normal_tex_id: -1 if none
-// //   payload: inout RayPayload (包含 dpdx/dpdy, dudx/dudy,dvdx/dvdy)
-// // ---------- 替换(并扩展签名): UpdateNormalDerivativesAndNormalMap ----------
-// // 说明：新增参数 uv_hit —— hit 点的插值 UV（使用 closesthit 里计算好的 object_texcoord）
-// void UpdateNormalDerivativesAndNormalMap(
-//     float3 v0, float3 v1, float3 v2,
-//     float3 n0, float3 n1, float3 n2,
-//     float2 uv0, float2 uv1, float2 uv2,
-//     float2 uv_hit,
-//     float2 bary,
-//     int normal_tex_id,
-//     float custom_lod, // 新增：自定义LOD值
-//     inout RayPayload payload)
-// {
-//     // 1) 三角形边
-//     float3 E1 = v1 - v0;
-//     float3 E2 = v2 - v0;
+// 综合：计算最终 world-space 法线导数并写入 payload.dndx/dndy
+// 参数：
+//   v0,v1,v2: triangle positions
+//   n0,n1,n2: vertex normals (shading normals)
+//   uv0,uv1,uv2: vertex uvs
+//   bary: (attr.barycentrics.x, attr.barycentrics.y)
+//   normal_tex_id: -1 if none
+//   payload: inout RayPayload (包含 dpdx/dpdy, dudx/dudy,dvdx/dvdy)
+// ---------- 替换(并扩展签名): UpdateNormalDerivativesAndNormalMap ----------
+// 说明：新增参数 uv_hit —— hit 点的插值 UV（使用 closesthit 里计算好的 object_texcoord）
+void UpdateNormalDerivativesAndNormalMap(
+    float3 v0, float3 v1, float3 v2,
+    float3 n0, float3 n1, float3 n2,
+    float2 uv0, float2 uv1, float2 uv2,
+    float2 uv_hit,
+    float2 bary,
+    int normal_tex_id,
+    float custom_lod, // 新增：自定义LOD值
+    inout RayPayload payload)
+{
+    // 1) 三角形边
+    float3 E1 = v1 - v0;
+    float3 E2 = v2 - v0;
 
-//     // 2) 计算顶点法线插值导数（world space）以及 shading normal（作为基准）
-//     float3 dndx_vert = float3(0,0,0);
-//     float3 dndy_vert = float3(0,0,0);
-//     float3 n_shading = float3(0,0,1);
+    // 2) 计算顶点法线插值导数（world space）以及 shading normal（作为基准）
+    float3 dndx_vert = float3(0,0,0);
+    float3 dndy_vert = float3(0,0,0);
+    float3 n_shading = float3(0,0,1);
 
-//     ComputeSmoothNormalDerivatives_Triangle(n0, n1, n2, E1, E2, bary, payload.dpdx, payload.dpdy, dndx_vert, dndy_vert, n_shading);
+    ComputeSmoothNormalDerivatives_Triangle(n0, n1, n2, E1, E2, bary, payload.dpdx, payload.dpdy, dndx_vert, dndy_vert, n_shading);
 
-//     // 3) 计算切线 / bitangent（triangle-level）
-//     float3 triT, triB;
-//     bool okTB = ComputeTriangleTangentBasis(v0, v1, v2, uv0, uv1, uv2, triT, triB);
-//     if (!okTB) {
-//         // 如果失败，基于 shading normal 构造任意正交基
-//         GetTangent(n_shading, triT, triB);
-//     } else {
-//         // 保证正交化并归一化 (Gram-Schmidt)
-//         triT = normalize(triT - n_shading * dot(n_shading, triT));
-//         triB = normalize(cross(n_shading, triT));
-//     }
-
-//     // 4) 如果存在 normal map，则采样 normal map 并计算其切线空间导数
-//     float3 dndx_map = float3(0,0,0);
-//     float3 dndy_map = float3(0,0,0);
-//     float3 final_world_normal = normalize(n_shading);
-
-//     if (normal_tex_id >= 0) {
-//         // 4.1 使用传入的custom_lod而不是内部计算
-//         Texture2D<float4> normal_tex = g_Textures[normal_tex_id];
+    // 3) 计算切线 / bitangent（triangle-level）
+    float3 triT, triB;
+    
+    {
+        // 计算导数 (你的逻辑)
+        float2 deltaUV1 = uv1 - uv0;
+        float2 deltaUV2 = uv2 - uv0;
         
-//         // 修改ComputeNormalMapDerivatives以支持自定义LOD
-//         float3 n_t; float3 dntdx_t; float3 dntdy_t;
-//         ComputeNormalMapDerivatives_WithCustomLOD( // 需要创建新函数
-//             normal_tex_id, uv_hit,
-//             payload.dudx, payload.dudy, payload.dvdx, payload.dvdy,
-//             custom_lod, // 使用自定义LOD
-//             n_t, dntdx_t, dntdy_t);
+        float det = (deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x);
+        
+        if (abs(det) < 1e-6) {
+            GetTangent(n_shading, triT, triB);
+        } else {
+            float invDet = 1.0 / det;
+            
+            // T = dp/du
+            triT = invDet * (deltaUV2.y * E1 - deltaUV1.y * E2);
+            // B = dp/dv
+            triB = invDet * (-deltaUV2.x * E1 + deltaUV1.x * E2);
 
-//         // 4.2 切线空间 (tangent-space) -> world-space 的变换
-//         // world normal from map:
-//         final_world_normal = normalize(triT * n_t.x + triB * n_t.y + n_shading * n_t.z);
+            triT = normalize(triT);
+            triB = normalize(triB);
+        }
+    }
 
-//         // 4.3 切线空间导数转换到 world-space
-//         // 近似：假定 triT, triB, n_shading 在三角片上近似常量（即 dT/dx≈0），因此：
-//         dndx_map = triT * dntdx_t.x + triB * dntdx_t.y + n_shading * dntdx_t.z;
-//         dndy_map = triT * dntdy_t.x + triB * dntdy_t.y + n_shading * dntdy_t.z;
+    // 4) 如果存在 normal map，则采样 normal map 并计算其切线空间导数
+    float3 dndx_map = float3(0,0,0);
+    float3 dndy_map = float3(0,0,0);
+    float3 final_world_normal = normalize(n_shading);
 
-//         // 注：若需要更高精度，可以在三角片级别估计 triT/d triB/d（复杂度增）
-//     }
+    if (normal_tex_id >= 0) {
+        
+        // 修改ComputeNormalMapDerivatives以支持自定义LOD
+        float3 n_t; float3 dntdx_t; float3 dntdy_t;
+        ComputeNormalMapDerivatives_WithCustomLOD( // 需要创建新函数
+            normal_tex_id, uv_hit,
+            payload.dudx, payload.dudy, payload.dvdx, payload.dvdy,
+            custom_lod, // 使用自定义LOD
+            n_t, dntdx_t, dntdy_t);
 
-//     // 5) 合并顶点插值导数与 normal-map 导数
-//     payload.dndx = dndx_vert + dndx_map;
-//     payload.dndy = dndy_vert + dndy_map;
+        // 4.2 切线空间 (tangent-space) -> world-space 的变换
+        // world normal from map:
+        final_world_normal = normalize(triT * n_t.x + triB * n_t.y + n_shading * n_t.z);
 
-//     // 6) 写回最终 world-space normal（使用 normal map 优先）
-//     payload.normal = normalize(final_world_normal);
-// }
+        // 4.3 切线空间导数转换到 world-space
+        // 近似：假定 triT, triB, n_shading 在三角片上近似常量（即 dT/dx≈0），因此：
+        dndx_map = triT * dntdx_t.x + triB * dntdx_t.y + n_shading * dntdx_t.z;
+        dndy_map = triT * dntdy_t.x + triB * dntdy_t.y + n_shading * dntdy_t.z;
 
-// [shader("closesthit")]
-// void ClosestHitMain(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {
-//     // 标记与基本信息
-//     payload.hit = true;
-//     payload.instance_id = InstanceID();
-//     uint primitive_id = PrimitiveIndex();
+        // 注：若需要更高精度，可以在三角片级别估计 triT/d triB/d（复杂度增）
+    }
 
-//     // world-space 射线和 t
-//     float3 ray_origin = WorldRayOrigin();
-//     float3 ray_direction = WorldRayDirection();
-//     float hit_distance = RayTCurrent();
-//     payload.hit_point = ray_origin + hit_distance * ray_direction;
+    // 5) 合并顶点插值导数与 normal-map 导数
+    payload.dndx = dndx_vert + dndx_map;
+    payload.dndy = dndy_vert + dndy_map;
 
-//     // 读取三角形顶点索引与原始顶点属性（object space）
-//     GeometryDescriptor geo_desc = geometry_descriptors[payload.instance_id];
-//     uint index_offset = geo_desc.index_offset + primitive_id * 3;
-//     uint i0 = indices[index_offset];
-//     uint i1 = indices[index_offset + 1];
-//     uint i2 = indices[index_offset + 2];
-
-//     VertexInfo v0 = vertices[geo_desc.vertex_offset + i0];
-//     VertexInfo v1 = vertices[geo_desc.vertex_offset + i1];
-//     VertexInfo v2 = vertices[geo_desc.vertex_offset + i2];
-
-//     // 重心按你给定的约定
-//     float w0 = attr.barycentrics.x; // weight for v1
-//     float w1 = attr.barycentrics.y; // weight for v2
-//     float w2 = 1.0 - w0 - w1;       // weight for v0
-
-//     // 插值 UV 按你的约定
-//     float2 uv_hit = w0 * v1.texcoord + w1 * v2.texcoord + w2 * v0.texcoord;
-
-//     // 将顶点位置与法线转换到 world-space —— 这一点很关键，保证 E1/E2 与 dpdx/dpdy 同坐标系
-//     float3x3 vertex_matrix = (float3x3)ObjectToWorld4x3();
-//     float3 p0_w = mul(vertex_matrix, v0.position);
-//     float3 p1_w = mul(vertex_matrix, v1.position);
-//     float3 p2_w = mul(vertex_matrix, v2.position);
-
-//     // 顶点法线从 object -> world（使用 3x3 部分）
-//     float3x3 normal_matrix = (float3x3)transpose(WorldToObject4x3());
-//     float3 n0_w = normalize(mul(normal_matrix, v0.normal));
-//     float3 n1_w = normalize(mul(normal_matrix, v1.normal));
-//     float3 n2_w = normalize(mul(normal_matrix, v2.normal));
-    
-
-//     // 三角形边（world-space）
-//     float3 E1_w = p1_w - p0_w; // corresponds to v1 - v0 (matches bary w0 mapping)
-//     float3 E2_w = p2_w - p0_w; // corresponds to v2 - v0
-
-//     if (length(v0.normal) < 1e-6f) {
-//         float3 geo_normal = normalize(cross(E1_w, E2_w));
-//         n0_w = geo_normal;
-//         n1_w = geo_normal;
-//         n2_w = geo_normal;
-//     } else {
-//         n0_w = normalize(n0_w);
-//         n1_w = normalize(n1_w);
-//         n2_w = normalize(n2_w);
-//     }
-
-//     // 计算位置微分 dpdx / dpdy（使用 ray differential 近似 p_rx = rxOrigin + t * rxDir，一个简单的近似）
-//     if (payload.diffs.hasDifferentials) {
-//         float3 hit_rx = payload.diffs.rxOrigin + hit_distance * payload.diffs.rxDirection;
-//         float3 hit_ry = payload.diffs.ryOrigin + hit_distance * payload.diffs.ryDirection;
-//         payload.dpdx = hit_rx - payload.hit_point;
-//         payload.dpdy = hit_ry - payload.hit_point;
-//     } else {
-//         payload.dpdx = float3(0.0, 0.0, 0.0);
-//         payload.dpdy = float3(0.0, 0.0, 0.0);
-//     }
-
-//     // 通过 SolveForCoeffs3x2 解出 ∂u/∂x, ∂v/∂x 与 ∂u/∂y, ∂v/∂y
-//     float2 ab_dx = SolveForCoeffs3x2(E1_w, E2_w, payload.dpdx); // a_dx = ∂u/∂x, b_dx = ∂v/∂x
-//     float2 ab_dy = SolveForCoeffs3x2(E1_w, E2_w, payload.dpdy); // a_dy = ∂u/∂y, b_dy = ∂v/∂y
-
-//     // 计算 uv 导数（注意 uv10 = uv1 - uv0, uv20 = uv2 - uv0；与重心 u=w0 对应 v1 保持一致）
-//     float2 uv10 = v1.texcoord - v0.texcoord;
-//     float2 uv20 = v2.texcoord - v0.texcoord;
-//     payload.dudx = uv10.x * ab_dx.x + uv20.x * ab_dx.y;
-//     payload.dvdx = uv10.y * ab_dx.x + uv20.y * ab_dx.y;
-//     payload.dudy = uv10.x * ab_dy.x + uv20.x * ab_dy.y;
-//     payload.dvdy = uv10.y * ab_dy.x + uv20.y * ab_dy.y;
-
-//     // 计算各纹理的 LOD 并以 LOD 采样 attribute / base color
-//     Material mat = materials[InstanceID()];
-//     int attribute_id = mat.attribute_tex_id;
-//     int texture_id = mat.texture_id;
-//     int normal_id = mat.normal_tex_id;
-    
-
-//     if (attribute_id >= 0) {
-//         float lod_attr = ComputeTextureLOD(g_Textures[attribute_id], payload.dudx, payload.dudy, payload.dvdx, payload.dvdy);
-//         payload.attribute = SampleTexture2D_Lod(attribute_id, uv_hit, lod_attr).rgba;
-//     } else {
-//         payload.attribute = float4(-1.0, -1.0, -1.0, -1.0);
-//     }
-
-//     if (texture_id >= 0) {
-//         float lod_col = ComputeTextureLOD(g_Textures[texture_id], payload.dudx, payload.dudy, payload.dvdx, payload.dvdy);
-//         payload.color = SampleTexture2D_Lod(texture_id, uv_hit, lod_col).rgb;
-//     } else {
-//         payload.color = mat.base_color;
-//     }
-
-//     // -------------------------------------------------
-//     // Adaptive normal map mip LOD
-//     // -------------------------------------------------
-//     float lod_normal = 0.0;
-
-//     if (payload.diffs.hasDifferentials && normal_id >= 0)
-//     {
-//         // A. surface-driven LOD（基于屏幕空间导数）
-//         lod_normal = ComputeTextureLOD(
-//             g_Textures[normal_id],
-//             payload.dudx, payload.dudy, payload.dvdx, payload.dvdy
-//         );
-//         // lod_normal = min(lod_normal, 10.0f); // 限制最大10级mip
-//     }
-//     // 计算并更新法线与法线导数（把 world-space 顶点位置与 world-space 顶点法线传入）
-//     // 注意：UpdateNormalDerivativesAndNormalMap 要求 v0..v2 与 n0..n2 在同一坐标系（我们已把它们变为 world-space）
-//     float2 bary = float2(w0, w1);
-//     UpdateNormalDerivativesAndNormalMap(
-//         p0_w, p1_w, p2_w,
-//         n0_w, n1_w, n2_w,
-//         v0.texcoord, v1.texcoord, v2.texcoord,
-//         uv_hit,
-//         bary,
-//         normal_id,
-//         lod_normal,
-//         payload);
-
-//     // 最终确保法线朝向与原射线一致（与原行为一致）
-//     payload.is_filp = false;
-//     if (dot(payload.normal, ray_direction) > 0.0) {
-//         payload.normal = -payload.normal;
-//         payload.is_filp = true;
-//     }
-// }
+    // 6) 写回最终 world-space normal（使用 normal map 优先）
+    payload.normal = normalize(final_world_normal);
+}
 
 [shader("closesthit")]
 void ClosestHitMain(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {
+    // 标记与基本信息
     payload.hit = true;
     payload.instance_id = InstanceID();
     uint primitive_id = PrimitiveIndex();
-    
-    // 获取几何数据
-    GeometryDescriptor geo_desc = geometry_descriptors[payload.instance_id];
-    
-    // 计算世界空间命中点
+
+    // world-space 射线和 t
     float3 ray_origin = WorldRayOrigin();
     float3 ray_direction = WorldRayDirection();
     float hit_distance = RayTCurrent();
     payload.hit_point = ray_origin + hit_distance * ray_direction;
-    
-    // 获取三角形顶点
+
+    // 读取三角形顶点索引与原始顶点属性（object space）
+    GeometryDescriptor geo_desc = geometry_descriptors[payload.instance_id];
     uint index_offset = geo_desc.index_offset + primitive_id * 3;
     uint i0 = indices[index_offset];
     uint i1 = indices[index_offset + 1];
     uint i2 = indices[index_offset + 2];
-    
+
     VertexInfo v0 = vertices[geo_desc.vertex_offset + i0];
     VertexInfo v1 = vertices[geo_desc.vertex_offset + i1];
     VertexInfo v2 = vertices[geo_desc.vertex_offset + i2];
-    
-    // 计算法线
-    float3 object_space_normal;
-    float w0 = attr.barycentrics.x;
-    float w1 = attr.barycentrics.y;
-    float2 object_texcoord = w0 * v1.texcoord + w1 * v2.texcoord + (1.0 - w0 - w1) * v0.texcoord;
-    int normal_id = materials[InstanceID()].normal_tex_id;
-    int attribute_id = materials[InstanceID()].attribute_tex_id;
-    if(normal_id >= 0) {
-        float3 norm = g_Textures[normal_id].SampleLevel(g_Sampler, object_texcoord, 0).rgb;
-        object_space_normal = normalize(norm * 2.0 - 1.0);
-    } else {
-    if (length(v0.normal) < 1e-6) {
-        // 使用几何法线
-        object_space_normal = cross(v1.position - v0.position, v2.position - v0.position);
-    } else {
-        // 插值顶点法线
-        object_space_normal = w0 * v1.normal + w1 * v2.normal + (1.0 - w0 - w1) * v0.normal;
-    }
-    }
-    if(attribute_id >= 0) {
-        payload.attribute = g_Textures[attribute_id].SampleLevel(g_Sampler, object_texcoord, 0).rgba;
-    }
-    object_space_normal = normalize(object_space_normal);
-    
-    // 转换到世界空间
+
+    // 重心按你给定的约定
+    float w0 = attr.barycentrics.x; // weight for v1
+    float w1 = attr.barycentrics.y; // weight for v2
+    float w2 = 1.0 - w0 - w1;       // weight for v0
+
+    // 插值 UV 按你的约定
+    float2 uv_hit = w0 * v1.texcoord + w1 * v2.texcoord + w2 * v0.texcoord;
+
+    // 将顶点位置与法线转换到 world-space —— 这一点很关键，保证 E1/E2 与 dpdx/dpdy 同坐标系
+    float3 p0_w = mul(float4(v0.position, 1.0), ObjectToWorld4x3());
+    float3 p1_w = mul(float4(v1.position, 1.0), ObjectToWorld4x3());
+    float3 p2_w = mul(float4(v2.position, 1.0), ObjectToWorld4x3());
+
+    // 顶点法线从 object -> world（使用 3x3 部分）
     float3x3 normal_matrix = (float3x3)transpose(WorldToObject4x3());
-    payload.normal = normalize(mul(normal_matrix, object_space_normal));
+    float3 n0_w = normalize(mul(normal_matrix, v0.normal));
+    float3 n1_w = normalize(mul(normal_matrix, v1.normal));
+    float3 n2_w = normalize(mul(normal_matrix, v2.normal));
     
-    int texture_id = materials[InstanceID()].texture_id;
-    if(texture_id >= 0){
-        payload.color = g_Textures[texture_id].SampleLevel(g_Sampler, object_texcoord, 0).rgb;
+
+    // 三角形边（world-space）
+    float3 E1_w = p1_w - p0_w; // corresponds to v1 - v0 (matches bary w0 mapping)
+    float3 E2_w = p2_w - p0_w; // corresponds to v2 - v0
+    float3 geo_normal = normalize(cross(E1_w, E2_w));
+
+    if (length(v0.normal) < 1e-6f) {
+        n0_w = geo_normal;
+        n1_w = geo_normal;
+        n2_w = geo_normal;
+    } else {
+        n0_w = normalize(n0_w);
+        n1_w = normalize(n1_w);
+        n2_w = normalize(n2_w);
     }
-    else payload.color = materials[InstanceID()].base_color;
+
+    // 计算位置微分 dpdx / dpdy（使用 ray differential 近似 p_rx = rxOrigin + t * rxDir，一个简单的近似）
+    if (payload.diffs.hasDifferentials) {
+        // float3 hit_rx = payload.diffs.rxOrigin + hit_distance * payload.diffs.rxDirection;
+        // float3 hit_ry = payload.diffs.ryOrigin + hit_distance * payload.diffs.ryDirection;
+        // payload.dpdx = hit_rx - payload.hit_point;
+        // payload.dpdy = hit_ry - payload.hit_point;
+
+        float plane_dist = dot(p0_w, geo_normal); // 平面方程常数项 d = N dot P
+
+        // 2. 计算相邻光线与该平面的真实交点距离 t
+        //    公式: t = (d - N dot O) / (N dot D)
+        float denom_rx = dot(payload.diffs.rxDirection, geo_normal);
+        float denom_ry = dot(payload.diffs.ryDirection, geo_normal);
+
+        // 防止除以零（对于平行光线或边缘情况，加一个极小值 EPS）
+        denom_rx = abs(denom_rx) < EPS ? EPS : denom_rx;
+        denom_ry = abs(denom_ry) < EPS ? EPS : denom_ry;
+
+        float t_rx = (plane_dist - dot(payload.diffs.rxOrigin, geo_normal)) / denom_rx;
+        float t_ry = (plane_dist - dot(payload.diffs.ryOrigin, geo_normal)) / denom_ry;
+
+        // 3. 使用真实的 t 计算邻像素的击中点
+        float3 hit_rx = payload.diffs.rxOrigin + t_rx * payload.diffs.rxDirection;
+        float3 hit_ry = payload.diffs.ryOrigin + t_ry * payload.diffs.ryDirection;
+
+        // 4. 计算正确的微分
+        payload.dpdx = hit_rx - payload.hit_point;
+        payload.dpdy = hit_ry - payload.hit_point;
+    } else {
+        payload.dpdx = float3(0.0, 0.0, 0.0);
+        payload.dpdy = float3(0.0, 0.0, 0.0);
+    }
+
+    // 通过 SolveForCoeffs3x2 解出 ∂u/∂x, ∂v/∂x 与 ∂u/∂y, ∂v/∂y
+    float2 ab_dx = SolveForCoeffs3x2(E1_w, E2_w, payload.dpdx); // a_dx = ∂u/∂x, b_dx = ∂v/∂x
+    float2 ab_dy = SolveForCoeffs3x2(E1_w, E2_w, payload.dpdy); // a_dy = ∂u/∂y, b_dy = ∂v/∂y
+
+    // 计算 uv 导数（注意 uv10 = uv1 - uv0, uv20 = uv2 - uv0；与重心 u=w0 对应 v1 保持一致）
+    float2 uv10 = v1.texcoord - v0.texcoord;
+    float2 uv20 = v2.texcoord - v0.texcoord;
+    payload.dudx = uv10.x * ab_dx.x + uv20.x * ab_dx.y;
+    payload.dvdx = uv10.y * ab_dx.x + uv20.y * ab_dx.y;
+    payload.dudy = uv10.x * ab_dy.x + uv20.x * ab_dy.y;
+    payload.dvdy = uv10.y * ab_dy.x + uv20.y * ab_dy.y;
+
+    // 计算各纹理的 LOD 并以 LOD 采样 attribute / base color
+    Material mat = materials[InstanceID()];
+    int attribute_id = mat.attribute_tex_id;
+    int texture_id = mat.texture_id;
+    int normal_id = mat.normal_tex_id;
     
-    // 确保法线朝向射线方向
+
+    if (attribute_id >= 0) {
+        float lod_attr = ComputeTextureLOD(g_Textures[attribute_id], payload.dudx, payload.dudy, payload.dvdx, payload.dvdy);
+        payload.attribute = SampleTexture2D_Lod(attribute_id, uv_hit, lod_attr).rgba;
+    } else {
+        payload.attribute = float4(-1.0, -1.0, -1.0, -1.0);
+    }
+
+    if (texture_id >= 0) {
+        float lod_col = ComputeTextureLOD(g_Textures[texture_id], payload.dudx, payload.dudy, payload.dvdx, payload.dvdy);
+        payload.color = SampleTexture2D_Lod(texture_id, uv_hit, lod_col).rgb;
+    } else {
+        payload.color = mat.base_color;
+    }
+
+    // -------------------------------------------------
+    // Adaptive normal map mip LOD
+    // -------------------------------------------------
+    float lod_normal = 0.0;
+
+    if (payload.diffs.hasDifferentials && normal_id >= 0)
+    {
+        // A. surface-driven LOD（基于屏幕空间导数）
+        lod_normal = ComputeTextureLOD(
+            g_Textures[normal_id],
+            payload.dudx, payload.dudy, payload.dvdx, payload.dvdy
+        );
+        // lod_normal = min(lod_normal, 10.0f); // 限制最大10级mip
+    }
+    // 计算并更新法线与法线导数（把 world-space 顶点位置与 world-space 顶点法线传入）
+    // 注意：UpdateNormalDerivativesAndNormalMap 要求 v0..v2 与 n0..n2 在同一坐标系（我们已把它们变为 world-space）
+    float2 bary = float2(w0, w1);
+    UpdateNormalDerivativesAndNormalMap(
+        p0_w, p1_w, p2_w,
+        n0_w, n1_w, n2_w,
+        v0.texcoord, v1.texcoord, v2.texcoord,
+        uv_hit,
+        bary,
+        normal_id,
+        lod_normal,
+        payload);
+
+    // 最终确保法线朝向与原射线一致（与原行为一致）
     payload.is_filp = false;
-    if (dot(payload.normal, ray_direction) > 0) {
+    if (dot(payload.normal, ray_direction) > 0.0) {
         payload.normal = -payload.normal;
         payload.is_filp = true;
     }

@@ -37,9 +37,10 @@ struct RenderSettings {  // Mainly for random seed
     int skybox_texture_id_;            // If not able, set to -1
 
     glm::vec2 resolution;
-    int  global_medium_enabled;
+    int global_medium_enabled;
     glm::vec3 global_sigma_a;
     glm::vec3 global_sigma_s;
+    int offset;
     glm::vec3 global_Le;
 };
 

@@ -2,7 +2,7 @@
 #include "long_march.h"
 #include "Scene.h" 
 #define MUL_INTENS 8
-#define MUL_INTENS_SKYBOX 0.75
+#define MUL_INTENS_SKYBOX 0.25
 
 struct Light {
     glm::vec3 position;       // 光源位置
