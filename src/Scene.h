@@ -23,19 +23,11 @@ public:
     Scene(grassland::graphics::Core* core);
     ~Scene();
 
-    // Add an entity to the scene with motion parameters
     void AddEntity(std::shared_ptr<Entity> entity);
 
-    // Remove all entities
     void Clear();
 
-    // Build/rebuild all TLAS structures (including motion groups)
     void BuildAccelerationStructures();
-
-    // Update TLAS instances for animation at time t (0-1 range)
-    // void UpdateInstancesAtTime(float t);
-
-    // start of modification
 
     grassland::graphics::AccelerationStructure* GetTLAS(int group_id = 0) const {
         if (group_id < 0 || group_id >= tlas_array_.size()) {
@@ -44,24 +36,16 @@ public:
         return tlas_array_[group_id] ? tlas_array_[group_id].get() : empty_tlas_.get();
     }
 
-    // end of modification
-
-    // Get all motion group TLAS
     const std::vector<MotionGroup>& GetMotionGroups() const { return motion_groups_; }
     
-    // Get number of motion groups
     size_t GetMotionGroupCount() const { return motion_groups_.size(); }
 
-    // Get motion group parameters buffer (for shader)
     grassland::graphics::Buffer* GetMotionGroupsBuffer() const { return motion_groups_buffer_.get(); }
 
-    // Get materials buffer for all entities
     grassland::graphics::Buffer* GetMaterialsBuffer() const { return materials_buffer_.get(); }
 
-    // Get all entities
     const std::vector<std::shared_ptr<Entity>>& GetEntities() const { return entities_; }
 
-    // Get number of entities
     size_t GetEntityCount() const { return entities_.size(); }
 
     grassland::graphics::Buffer* GetVertexInfoBuffer() const { return global_vertex_info_buffer_.get(); }
@@ -71,22 +55,19 @@ public:
 private:
     void UpdateMaterialsBuffer();
     void BuildGeometryBuffers();
-    void BuildMotionGroupsBuffer();  // 构建运动组
+    void BuildMotionGroupsBuffer(); 
     
-    // 计算实体应该属于哪个运动组
     int CalculateMotionGroup(const MotionParams& motion);
     
-    // 为运动组构建TLAS
     void BuildGroupTLAS(int group_id);
     
     grassland::graphics::Core* core_;
     std::vector<std::shared_ptr<Entity>> entities_;
     
-    // 运动组管理
     std::vector<MotionGroup> motion_groups_;
 
     std::unique_ptr<grassland::graphics::Buffer> motion_groups_buffer_;
-    std::vector<std::unique_ptr<grassland::graphics::AccelerationStructure>> tlas_array_; // 使用 unique_ptr 来管理所有权
+    std::vector<std::unique_ptr<grassland::graphics::AccelerationStructure>> tlas_array_;
     std::unique_ptr<grassland::graphics::AccelerationStructure> empty_tlas_;
 
     std::unique_ptr<grassland::graphics::Buffer> materials_buffer_;

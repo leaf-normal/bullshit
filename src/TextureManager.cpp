@@ -48,6 +48,7 @@ TextureManager::BuildMipChainRGBA8(const unsigned char* base, int width, int hei
     }
     return mips;
 }
+
 //HDR: RGB32
 std::vector<std::vector<float>>
 TextureManager::BuildMipChainRGBA32(const float* base, int width, int height) {
@@ -115,9 +116,6 @@ int TextureManager::LoadTexture(const std::string& filename) {
 int TextureManager::LoadHDRTexture(const std::string& filename, float intensity = 1.0) {
     Texture tex{};
     
-    // stbi_set_flip_vertically_on_load(true); // HDR纹理通常需要垂直翻转
-    
-    // 加载HDR图像
     float* img = stbi_loadf(filename.c_str(), &tex.width, &tex.height, &tex.channels, 0);
     if (!img) {
         throw std::runtime_error("Failed to load HDR texture: " + filename);
@@ -215,7 +213,6 @@ void TextureManager::ComputeHDRDistribution(Texture& texture) {
     
     distribution.total_luminance = total_luminance * (PI / height) * (2.0f * PI / width); // with area
     
-    // 2. 计算条件CDF（每行）
     distribution.conditional_cdf.resize(width * height);
     for (int y = 0; y < height; ++y) {
         float cumulative = 0.0f;
@@ -225,14 +222,12 @@ void TextureManager::ComputeHDRDistribution(Texture& texture) {
                 distribution.conditional_cdf[y * width + x] = cumulative;
             }
         } else {
-            // 如果行总和为0，使用均匀分布
             for (int x = 0; x < width; ++x) {
                 distribution.conditional_cdf[y * width + x] = (x + 1.0f) / width;
             }
         }
     }
     
-    // 3. 计算边缘CDF（行方向）
     distribution.marginal_cdf.resize(height);
     float cumulative = 0.0f;
     if (total_luminance > 0.0f) {
@@ -241,13 +236,11 @@ void TextureManager::ComputeHDRDistribution(Texture& texture) {
             distribution.marginal_cdf[y] = cumulative;
         }
     } else {
-        // 如果总亮度为0，使用均匀分布
         for (int y = 0; y < height; ++y) {
             distribution.marginal_cdf[y] = (y + 1.0f) / height;
         }
     }
     
-    // 验证CDF
     if (!distribution.marginal_cdf.empty()) {
         float max_cdf = distribution.marginal_cdf.back();
         if (std::abs(max_cdf - 1.0f) > 1e-6f) {
@@ -263,22 +256,18 @@ void TextureManager::ComputeHDRDistribution(Texture& texture) {
     std::vector<float> cdf_data;
     cdf_data.reserve(3 + width * height + height);
     
-    // 存储宽度和高度
     cdf_data.push_back(static_cast<float>(width));
     cdf_data.push_back(static_cast<float>(height));
     cdf_data.push_back(distribution.total_luminance);
     
-    // 存储条件CDF
     cdf_data.insert(cdf_data.end(), 
                    distribution.conditional_cdf.begin(), 
                    distribution.conditional_cdf.end());
     
-    // 存储边缘CDF
     cdf_data.insert(cdf_data.end(),
                    distribution.marginal_cdf.begin(),
                    distribution.marginal_cdf.end());
     
-    // 创建GPU缓冲区
     core_->CreateBuffer(buffer_size, 
                        grassland::graphics::BUFFER_TYPE_DYNAMIC,
                        &distribution.cdf_buffer);
@@ -354,7 +343,6 @@ grassland::graphics::Buffer* TextureManager::GetOrCreateMipInfoBuffer() {
     BuildMipInfo(infos);
 
     if (infos.empty()) {
-        // 保证至少有一个元素，避免空缓冲绑定
         infos.push_back({0u, 0u});
     }
 

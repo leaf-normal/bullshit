@@ -17,24 +17,20 @@ Film::~Film() {
 }
 
 void Film::CreateImages() {
-    // Create accumulated color image (RGBA32F for high precision accumulation)
     core_->CreateImage(width_, height_, 
                       grassland::graphics::IMAGE_FORMAT_R32G32B32A32_SFLOAT,
                       &accumulated_color_image_);
     
-    // Create accumulated samples image (R32_SINT to count samples)
     core_->CreateImage(width_, height_, 
                       grassland::graphics::IMAGE_FORMAT_R32_SINT,
                       &accumulated_samples_image_);
     
-    // Create output image (RGBA32F for final result)
     core_->CreateImage(width_, height_, 
                       grassland::graphics::IMAGE_FORMAT_R32G32B32A32_SFLOAT,
                       &output_image_);
 }
 
 void Film::Reset() {
-    // Clear accumulated color to black
     std::unique_ptr<grassland::graphics::CommandContext> cmd_context;
     core_->CreateCommandContext(&cmd_context);
     cmd_context->CmdClearImage(accumulated_color_image_.get(), { {0.0f, 0.0f, 0.0f, 0.0f} });
@@ -47,8 +43,6 @@ void Film::Reset() {
 }
 
 void Film::DevelopToOutput() {
-    // This would ideally be done in a compute shader for efficiency
-    // For now, we'll do it on the CPU (simple but potentially slow)
     
     if (sample_count_ == 0) {
         return;

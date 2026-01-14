@@ -11,7 +11,7 @@ Entity::Entity(const std::string& obj_file_path,
                const MotionParams& motion)
     : material_(material)
     , transform_(transform)
-    , motion_params_(motion)  // 初始化运动参数
+    , motion_params_(motion)
     , mesh_loaded_(false) {
     
     LoadMesh(obj_file_path);
@@ -46,7 +46,6 @@ void Entity::BuildBLAS(grassland::graphics::Core* core) {
         return;
     }
 
-    // *add
 
     std::vector<VertexInfo> vertex_infos;
     vertex_infos.reserve(mesh_.NumVertices());

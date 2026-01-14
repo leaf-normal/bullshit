@@ -38,7 +38,6 @@ void LightManager::Initialize(grassland::graphics::Core* core, Scene* scene) {
 void LightManager::AddLight(const Light& light) {
     lights_.push_back(light);
     
-    // 如果光源可见且是面光源或球光源，创建对应的Entity
     if (light.visible && (light.type == 1 || light.type == 3) && scene_ != nullptr) {
         std::shared_ptr<Entity> light_entity = CreateLightEntity(light, lights_.size() - 1);
         if (light_entity) {
@@ -52,10 +51,10 @@ void LightManager::AddLight(const Light& light) {
     grassland::LogInfo("Added light (total: {})", lights_.size());
 }
 
-void LightManager::RemoveLight(size_t index) { // unnecessary, keep empty
+void LightManager::RemoveLight(size_t index) { // unnecessary
 }
 
-void LightManager::UpdateLight(size_t index, const Light& light) { // unnecessary, no need for modification
+void LightManager::UpdateLight(size_t index, const Light& light) { // unnecessary
     if (index < lights_.size()) {
         lights_[index] = light;
         UpdateBuffers();
@@ -68,12 +67,12 @@ void LightManager::UpdateLight(size_t index, const Light& light) { // unnecessar
 void LightManager::UpdatePowerData() {
     if (!buffers_initialized_ || !core_) return;
     
-    // 重置数据
+    // Reset
     power_weights_.clear();
     total_power_ = hdr_power_;
     float max_power = hdr_power_;
     
-    // 计算每个光源的功率
+    // Power calculation
     std::vector<float> powers;
     powers.reserve(lights_.size() + 1);
     
@@ -98,7 +97,7 @@ void LightManager::UpdatePowerData() {
 
     powers.push_back(hdr_power_);    
     
-    // 计算归一化的功率权重
+    // Calculate normalized weights
     if (total_power_ > 1e-6) {
         for (size_t i = 0; i < powers.size(); ++i) {
             float weight = powers[i] / total_power_;
@@ -110,7 +109,7 @@ void LightManager::UpdatePowerData() {
         grassland::LogWarning("Total power too low !");        
     }
     
-    // 上传功率权重数据到GPU
+    // Upload to GPU
     if (!power_weights_.empty()) {
         power_weights_buffer_->UploadData(power_weights_.data(), 
                                          power_weights_.size() * sizeof(float));
@@ -142,15 +141,14 @@ std::shared_ptr<Entity> LightManager::CreateLightEntity(const Light& light, size
     Material material;
     material.light_index = light_index;
     
-    if (light.type == 1) { // 面光源
-        mesh_path = "meshes/square_light.obj"; // 边长为1的正方形，法向指向z
+    if (light.type == 1) { // surface light
+        mesh_path = "meshes/square_light.obj";
         
-        // 计算面光源的变换矩阵
         transform = CalculateAreaLightTransform(light);
     } 
-    else if (light.type == 3) { // 球光源
-        mesh_path = "meshes/ball.obj"; // 半径为1.0的球体
-        // 移动到光源位置并缩放到正确半径
+    else if (light.type == 3) { // sphere light
+        mesh_path = "meshes/ball.obj";
+
         float scale = light.radius;
         transform = glm::scale(
             glm::translate(glm::mat4(1.0f), light.position),
@@ -158,7 +156,6 @@ std::shared_ptr<Entity> LightManager::CreateLightEntity(const Light& light, size
         );
     }
     else {
-        // 其他类型的光源不需要实体
         return nullptr;
     }
     
@@ -183,13 +180,13 @@ glm::mat4 LightManager::CalculateAreaLightTransform(const Light& light) const {
     
     glm::vec3 bitangent = glm::normalize(glm::cross(light.direction, light.tangent));
     
-    // 构建旋转矩阵
+    // rotation matrix
     glm::mat3 rotation;
-    rotation[0] = light.tangent;     // X轴
-    rotation[1] = bitangent;         // Y轴  
-    rotation[2] = light.direction;   // Z轴（法线）
+    rotation[0] = light.tangent;     // x
+    rotation[1] = bitangent;         // y  
+    rotation[2] = light.direction;   // z
     
-    // 构建完整的变换矩阵
+    // transform matrix
     glm::mat4 transform = glm::mat4(1.0f);
     transform = glm::translate(transform, light.position);
     transform = transform * glm::mat4(rotation);
@@ -206,17 +203,17 @@ float CalculateLightPowerCPU(const Light& light) {
     const float PI = 3.14159265359f;
     
     switch (light.type) {
-        case 0: // 点光源
+        case 0: // point light
             return luminance * 4.0f * PI;
-        case 1: // 面光源
+        case 1: // area light
             return luminance * light.size.x * light.size.y * PI;
-        case 2: // 聚光灯
+        case 2: // spot light
             {
                 float cos_half_angle = cos(glm::radians(light.cone_angle * 0.5f));
                 float solid_angle = 2.0f * PI * (1.0f - cos_half_angle);
                 return luminance * solid_angle;
             }
-        case 3: // 球光源
+        case 3: // sphere light
             {
                 float surface_area = 4.0f * PI * light.radius * light.radius;
                 return luminance * surface_area * PI;
@@ -315,10 +312,9 @@ void LightManager::CreateDefaultLights() {
     // );
     // lights_.push_back(invisible_spot);
     
-    // 更新缓冲区
     UpdateBuffers();
     
-    // 创建可见光源的实体
+    // visible light entities
     for (size_t i = 0; i < lights_.size(); ++i) {
         const auto& light = lights_[i];
         if (light.visible && (light.type == 1 || light.type == 3) && scene_ != nullptr) {
