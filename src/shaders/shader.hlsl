@@ -486,7 +486,7 @@ void sample_spot_light(inout Light light, inout float3 hit_point, inout uint see
     float epsilon = 0.1 * (1.0 - cos_cutoff);
     float spot_factor = smoothstep(cos_cutoff, cos_cutoff + epsilon, cos_angle);
     
-    // 物理正确的辐射亮度
+    // // 物理正确的辐射亮度
     float solid_angle = 2.0 * PI * (1.0 - cos_cutoff);
     sample.radiance = light.color * light.intensity * spot_factor / (distance * distance + 1e-6);
     
@@ -543,7 +543,7 @@ void sample_hdr(inout float3 hit_point, inout uint seed, out LightSample sample)
     float v = (float(row) + 0.5) / height;
     
     // phi 范围 [-π, π]，当 u=0.5 时 phi=0（+x轴）
-    float phi = u * TWO_PI - PI;
+    float phi = u * TWO_PI - PI/2;
     float theta = v * PI;
     
     float sin_theta = sin(theta);
@@ -746,7 +746,41 @@ float3 SampleGGX_Distribution(float roughness, float2 rd, inout float3 normal, i
     return normalize(H_world);
 }
 
-// ====================== Adaptive mipmap 辅助函数 =============== 
+// =======================Subsurface Diffusion=======================
+float BurleyDiffuse_Fd(float NdotL, float NdotV, float roughness, float subsurface)
+{
+    NdotL = saturate(NdotL);
+    NdotV = saturate(NdotV);
+    float FL = SchlickWeight(NdotL);
+    float FV = SchlickWeight(NdotV);
+    float Fd90 = 0.5 + 2.0 * roughness * NdotL * NdotL;
+    float Fd = (1.0 + (Fd90 - 1.0) * FL) * (1.0 + (Fd90 - 1.0) * FV);
+    float k = saturate(0.5 * subsurface);
+    float NdotL_wrap = saturate((NdotL + k) / (1.0 + k));
+    float retro = 0.5 * subsurface * (1.0 - NdotL) * (1.0 - NdotV);
+    float Fd_ss = Fd * NdotL_wrap + retro;
+    Fd_ss = saturate(Fd_ss);
+    float Fd_lambert = NdotL;
+    float Fd_mix = lerp(Fd_lambert, Fd_ss, subsurface);
+    return Fd_mix;
+}
+float3 SubsurfaceThinTransmission(float3 base_color, float thickness, float3 sigma_a)
+{
+    // Beer-Lambert: T = exp(-sigma_a * thickness)
+    float3 T = exp(-sigma_a * thickness);
+    return T * base_color;
+}
+
+// ====================== Mip atlas explicit LOD sampling ======================
+
+// 将 (texId, lod) 映射到 g_MipAtlas 的全局索引
+uint GetMipAtlasIndex(int texId, int lod)
+{
+    if (texId < 0) return 0;
+    MipInfo info = mip_infos[texId];
+    int clamped = clamp(lod, 0, int(info.levels) - 1);
+    return info.start + clamped;
+}
 
 float4 SampleTexture2D_Lod(int texId, float2 uv, float lodf)
 {
@@ -769,6 +803,9 @@ float4 SampleTexture2D_Lod(int texId, float2 uv, float lodf)
     // 插值
     return lerp(c0, c1, t);
 }
+
+
+// ====================== Adaptive mipmap 辅助函数 =============== 
 
 // Solve 2x2 linear system A * x = b, where A = [a00 a01; a10 a11].
 // 返回是否成功（行列式不太小），并把解写入 out_x (float2)。
@@ -1100,13 +1137,13 @@ bool SampleBSDF(inout Material mat, inout float3 ray, inout float3 normal, out f
   float clearcoatweight=0.25*mat.clearcoat*(1.0-mat.transparency);//清漆层
   float sheenweight=mat.sheen*(1.0-mat.metallic)*(1.0-mat.transparency);//光泽层
   //normalization
-  float total=diffuseweight+specularweight+transmissionweight+sheenweight+clearcoatweight;
+  float total=diffuseweight+specularweight+transmissionweight+sheenweight;//+clearcoatweight;
   diffuseweight/=total;
   specularweight/=total;
   transmissionweight/=total;
   sheenweight/=total;
-  clearcoatweight/=total;
-  float randLobe=random(seed);
+  //clearcoatweight/=total;
+  float randLobe=random(seed)*(1+clearcoatweight);
   float3 tangent, bitangent;
   GetTangent(normal, tangent, bitangent);  
   if(randLobe<diffuseweight+sheenweight)//漫反射+简化光泽层模型
@@ -1190,12 +1227,12 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
   float sheenweight=mat.sheen*(1.0-mat.metallic)*(1.0-mat.transparency);//光泽层
   float clearcoatweight=0.25*mat.clearcoat*(1.0-mat.transparency);//清漆层  
   //normalization
-  float total=diffuseweight+specularweight+transmissionweight+sheenweight+clearcoatweight;
+  float total=diffuseweight+specularweight+transmissionweight+sheenweight;//+clearcoatweight;
   diffuseweight/=total;
   specularweight/=total;
   transmissionweight/=total;
   sheenweight/=total;
-  clearcoatweight/=total;
+  //clearcoatweight/=total;
   if(is_trans)//透射
   {
     // float n1 = is_flip ? mat.ior : 1.0; // V 侧 (Camera 侧)
@@ -1249,7 +1286,7 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
     float commonDenom = sqrtDenom * sqrtDenom + EPS;
     float factor = (abs(VdotH) * abs(LdotH) * n2 * n2) / (abs(NdotV) * abs(NdotL) * commonDenom);
     float shit = 0.86 / (0.6 / (exp( (- min(Ndotray,0.5) + 0.18) * 12) + 1) + 0.27);
-    ret += mat.base_color * T_color * D * G * factor * transmissionweight * shit;   // 神秘参数
+    ret += mat.base_color * T_color * D * G * factor * transmissionweight * shit;   //神秘参数
     // ret += mat.base_color * T_color * D * G * factor * transmissionweight;  // 正常版本
     float jacobian = (n2 * n2 * abs(LdotH)) / commonDenom;
     float pdf_h_vndf = (D * G1V * abs(VdotH)) / (abs(NdotV) + EPS);
@@ -1283,6 +1320,7 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
     {
         float3 tint=lerp(float3(1.0, 1.0, 1.0), mat.base_color, mat.specular_tint);
         spec*=tint;
+
     }
     ret+=spec*specularweight;
     float aspect_eff = sqrt(1.0 - 0.9 * mat.anisotropic);
@@ -1303,20 +1341,22 @@ float3 EvalBSDF(inout Material mat, inout float3 ray, inout float3 wi, inout flo
     //光泽层
     if (mat.sheen > EPS && mat.metallic < 1.0 && mat.transparency < 1.0)
     {
-        float3 base=mat.base_color;
-        float lum = max(EPS, 0.2126 * base.x + 0.7152 * base.y + 0.0722 * base.z);
-        float3 tintColor = base / lum; // 提取色相（去亮度）
+        float3 base = mat.base_color;
+        float lum = max(0.001, 0.2126*base.x + 0.7152*base.y + 0.0722*base.z);
+        float3 tintColor = normalize(base / lum);
         float3 sheenColor = lerp(float3(1.0,1.0,1.0), tintColor, mat.sheen_tint);
-        float w = SchlickWeight(abs(Hdotray)); // 角度权重，常用 H·V
-        float3 sheenTerm = sheenColor * (mat.sheen) * w;
-        ret += sheenweight * sheenTerm * (1.0 - F);
-        sheenPDF = diffusePDF; // 复用 cosine 采样的 PDF
+        float w = pow(1.0 - abs(Ndotray), 5.0);
+        float3 sheenTerm = sheenColor * mat.sheen * w;
+        float F_avg = (F.x + F.y + F.z) / 3.0;
+        ret += sheenweight * sheenTerm * (1.0 - F_avg) * 0.5;
+        sheenPDF = diffusePDF;
     }
+
     //清漆层
     if (mat.clearcoat > EPS && mat.transparency < 1.0)
     {
         float alpha_c = max(EPS, mat.clearcoat_roughness);
-        float Dc = GTR1(NdotH, alpha_c);
+        float Dc = GTR2(NdotH, alpha_c);
         float Gc = SmithG_GGX(NdotV, alpha_c) * SmithG_GGX(NdotL, alpha_c);
         float Fc = SchlickFresnelScalar(0.04, abs(Hdotray));
         float coat = (Dc * Gc * Fc) / (4.0 * abs(NdotV) * abs(NdotL) + EPS);
@@ -1479,6 +1519,27 @@ float2 concentric_sample_disk(inout uint seed) {
     return r * float2(cos(theta), sin(theta));
 }
 
+float3 compute_focal_point(float3 ray_origin, float3 ray_dir, float focal_distance) {
+    // 计算光线与焦平面的交点
+    // 假设焦平面垂直于相机前向方向
+    float3 camera_forward = float3(0.0, 0.0, -1.0); // 相机空间前向
+    float3 world_forward = mul((float3x3)camera_info.camera_to_world, camera_forward);
+    world_forward = normalize(world_forward);
+    
+    // 焦平面方程: dot(p - (origin + world_forward * focal_distance), world_forward) = 0
+    float3 focal_plane_origin = ray_origin + world_forward * focal_distance;
+    float denom = dot(ray_dir, world_forward);
+    
+    if (abs(denom) > 1e-6) {
+        float t = dot(focal_plane_origin - ray_origin, world_forward) / denom;
+        return ray_origin + ray_dir * t;
+    }
+    
+    // 平行于焦平面，使用近似值
+    return ray_origin + ray_dir * focal_distance;
+}
+
+
 // 生成主射线与两个邻像素射线（用于差分）
 // pixel: integer pixel coords (SV_DispatchThreadID or similar)
 // pixel_sample_offset: subpixel jitter in [0,1) for anti-aliasing
@@ -1598,6 +1659,19 @@ float GetSpectralAlbedo(float3 rgb, float3 w_spectral)
     }
 }
 
+float3 GetSpectralWeight(float wavelength_nm)
+{
+    // 波长范围 [380, 780], 步长 5nm, 共81个点
+    // SPECTRAL_TABLE[0] 对应 380nm, SPECTRAL_TABLE[80] 对应 780nm
+    float t = (wavelength_nm - 380.0) / 5.0;
+    int idx = (int)clamp(t, 0.0, 80.0);
+    
+    if (idx >= 80) return SPECTRAL_TABLE[80];
+    
+    float fract = t - (float)idx;
+    return lerp(SPECTRAL_TABLE[idx], SPECTRAL_TABLE[idx + 1], fract);
+}
+
 // 使用柯西公式计算折射率
 // n(lambda) = A + B/lambda^2 + C/lambda^4
 // wavelength_nm: 波长，单位纳米
@@ -1656,7 +1730,7 @@ void RayGenMain() {
     
     // 生成像素采样偏移（抗锯齿）
     float2 pixel_sample_offset = render_setting.enable_accumulation ? 
-                                 random2(seed) : float2(0.5, 0.5);
+                                 random2(seed): float2(0.5, 0.5);
 
     // float2 pixel_sample_offset = float2(0.5, 0.5);
 
@@ -1820,11 +1894,13 @@ void RayGenMain() {
                 // 路径前缀上的 Beer（到 scattering 点）
                 float3 T = exp(-medium.sigma_t * t_medium);
 
-                float pdf_t = max(dot(medium.sigma_t, T) / 3.0, eps);
-
-                color += medium.Le * (1.0f - T) / medium.sigma_t * throughput / pdf_t;
+                float pdf_t = dot(medium.sigma_t, T) / 3.0;
             
-                throughput *= T * medium.sigma_s / pdf_t; // 散射系数
+                throughput *= T / pdf_t;
+                // 体积自发光
+                color += medium.Le * throughput; // 视为单个点光源
+
+                throughput *= medium.sigma_s; // 散射系数
 
                 // 采样 lights（和 surface 的 direct 类似，只是 BSDF 换成 phase function）
                 float3 vol_direct = mis_direct_lighting(light_count, scatter_point, float3(0.0f, 0.0f, 0.0f), mat, float3(0.0f, 0.0f, 0.0f), payload.is_filp, seed);
@@ -1855,7 +1931,7 @@ void RayGenMain() {
                 continue;
             }else{
                 float3 T_surf = exp(-medium.sigma_t * surface_dist);
-                float pdf_t = max((T_surf.r + T_surf.g + T_surf.b) / 3.0, eps); // 显式定义概率
+                float pdf_t = (T_surf.r + T_surf.g + T_surf.b) / 3.0; // 显式定义概率
 
                 if (any(medium.Le > 0.0)) {
                     color += (1.0 - T_surf) * medium.Le / medium.sigma_t * (throughput / pdf_t);
@@ -2232,7 +2308,7 @@ void MissMain(inout RayPayload payload) {
         // 采样HDR天空盒
         float3 normalizedDir = normalize(WorldRayDirection());
         
-        float phi = atan2(normalizedDir.z, normalizedDir.x);
+        float phi = atan2(normalizedDir.z, normalizedDir.x) + PI/2;
         float theta = acos(clamp(normalizedDir.y, -1.0, 1.0));
         
         // 将球面坐标转换为UV坐标
@@ -2288,6 +2364,35 @@ float ComputeTextureLOD(Texture2D<float4> tex,
     if (lod < 0.0) lod = 0.0;
     return lod;
 }
+
+// // --- 1.1 计算三角形切线/副切线（per-triangle, constant） ---
+// // 返回 true 表示成功（UV 矩阵非退化），并输出 tangent, bitangent（未归一化后可 normalize）
+// bool ComputeTriangleTangentBasis(
+//     float3 v0, float3 v1, float3 v2,
+//     float2 uv0, float2 uv1, float2 uv2,
+//     out float3 tangent, out float3 bitangent)
+// {
+//     float3 E1 = v1 - v0;
+//     float3 E2 = v2 - v0;
+//     float du1 = uv1.x - uv0.x;
+//     float du2 = uv2.x - uv0.x;
+//     float dv1 = uv1.y - uv0.y;
+//     float dv2 = uv2.y - uv0.y;
+
+//     float det = du1 * dv2 - du2 * dv1;
+//     float tol = 1e-8;
+//     if (abs(det) < tol) {
+//         tangent = float3(0,0,0);
+//         bitangent = float3(0,0,0);
+//         return false;
+//     }
+//     float invDet = 1.0 / det;
+//     tangent = ( E1 * dv2 - E2 * dv1 ) * invDet;
+//     bitangent = ( -E1 * du2 + E2 * du1 ) * invDet;
+//     tangent = normalize(tangent);
+//     bitangent = normalize(bitangent);
+//     return true;
+// }
 
 // --- 1.2 顶点法线插值导数（barycentric 导数法） ---
 // ---------------------------------------------------------------------------
