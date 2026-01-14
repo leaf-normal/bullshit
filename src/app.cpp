@@ -24,32 +24,32 @@ namespace {
 Application::Application(grassland::graphics::BackendAPI api) 
     : frame_count_(0)
     , samples_per_pixel_(1)
-    // 实际景深参数
+    // Actual depth of field parameters
     , focal_distance_(2.0f)
     , aperture_size_(0.04f)
     , focal_length_(0.030f)
-    // 临时景深参数（初始化为实际值）
+    // Temporary depth of field parameters (initialized to actual values)
     , temp_focal_distance_(5.0f)
     , temp_aperture_size_(0.1f)
     , temp_focal_length_(0.035f)
-    // 状态标志
+    // State flags
     , depth_of_field_enabled_(false)
     , depth_of_field_ui_open_(false)
-    // 运动模糊
+    // Motion blur
     , motion_blur_enabled_(false)
-    , exposure_time_(0.1f)  // 默认100ms曝光
+    , exposure_time_(0.1f) 
     , camera_linear_velocity_(glm::vec3(0.0f))
     , camera_angular_velocity_(0.0f)
     , motion_blur_ui_open_(false)
     , temp_exposure_time_(0.1f)
     , temp_camera_linear_velocity_(glm::vec3(0.0f))
     , temp_camera_angular_velocity_(0.0f)
-    // 滚轮状态
+    // Mouse wheel state
     , wheel_accumulator_(0.0)
     , wheel_processed_(true)
     , enable_skybox_(false)
     , skybox_texture_id_(-1)
-    // 色散状态
+    // Dispersion state
     , dispersion_enabled_(false){
 
     grassland::graphics::CreateCore(api, grassland::graphics::Core::Settings{}, &core_);
@@ -122,8 +122,7 @@ void Application::ProcessInput() {
         }
     }
 
-    // start of modification 
-    // F键切换景深效果
+    // F key to toggle depth of field effect
     static bool f_was_pressed = false;
     bool f_pressed = (glfwGetKey(glfw_window, GLFW_KEY_F) == GLFW_PRESS);
     
@@ -143,19 +142,17 @@ void Application::ProcessInput() {
         if (depth_of_field_enabled_ && !camera_enabled_) {
             float wheel_sensitivity = 0.25f;
             
-            // 直接更新实际参数（滚轮是实时调整）
+            // Update actual parameters directly (mouse wheel for real-time adjustment)
             focal_distance_ += static_cast<float>(wheel_accumulator_) * wheel_sensitivity;
             focal_distance_ = glm::clamp(focal_distance_, 0.05f, 500.0f);
             
-            // 同时更新临时参数，保持UI显示一致
+            // Update temporary parameters to keep UI display consistent
             temp_focal_distance_ = focal_distance_;
             
-            // 重置累积渲染
             film_->Reset();
             frame_count_ = 0;
         }
         
-        // 重置滚轮状态
         wheel_accumulator_ = 0.0;
         wheel_processed_ = true;
     }
@@ -190,7 +187,6 @@ void Application::ProcessInput() {
     }
     d_was_pressed = d_pressed;    
 
-    // end of modification
 }
 
 void Application::OnMouseMove(double xpos, double ypos) {
@@ -261,17 +257,15 @@ void Application::OnMouseButton(int button, int action, int mods, double xpos, d
         }
     }
 }
-// start of modification
+
 void Application::OnScroll(double xoffset, double yoffset) {
     wheel_accumulator_ += yoffset;
     wheel_processed_ = false;
     
-    // grassland::LogInfo("Scroll: x={:.2f}, y={:.2f}, accumulator={:.2f}", 
-    //                   xoffset, yoffset, wheel_accumulator_);
 }
 
 void Application::ApplyDepthOfFieldParams() {
-    // 检查参数是否有效
+    // Validate parameters
     bool valid = true;
     
     if (temp_focal_distance_ < 0.05f || temp_focal_distance_ > 500.0f) {
@@ -290,15 +284,13 @@ void Application::ApplyDepthOfFieldParams() {
     }
     
     if (!valid) {
-        return; // 参数无效，不应用
+        return; 
     }
     
-    // 应用参数
     focal_distance_ = temp_focal_distance_;
     aperture_size_ = temp_aperture_size_;
     focal_length_ = temp_focal_length_;
     
-    // 重置累积渲染
     if (!camera_enabled_) {
         film_->Reset();
         frame_count_ = 0;
@@ -312,7 +304,7 @@ void Application::ApplyDepthOfFieldParams() {
 }
 
 void Application::ApplyMotionBlurParams() {
-    // 检查参数是否有效
+    // Validate parameters
     bool valid = true;
     
     if (temp_exposure_time_ < 0.000f || temp_exposure_time_ > 2.0f) {
@@ -334,12 +326,10 @@ void Application::ApplyMotionBlurParams() {
         return;
     }
     
-    // 应用参数
     exposure_time_ = temp_exposure_time_;
     camera_linear_velocity_ = temp_camera_linear_velocity_;
     camera_angular_velocity_ = temp_camera_angular_velocity_;
     
-    // 重置累积渲染
     if (!camera_enabled_) {
         film_->Reset();
         frame_count_ = 0;
@@ -352,248 +342,6 @@ void Application::ApplyMotionBlurParams() {
     grassland::LogInfo("  Camera angular velocity: {:.2f} rad/s", 
                       camera_angular_velocity_);
 }
-// end of modification
-
-
-
-void AddBSDFTestColumn(
-    std::unique_ptr<Scene>& scene,
-    const glm::vec3& base_color,
-    float x_position,
-    std::function<Material(float)> create_material
-) {
-    const float param_values[5] = {0.05f, 0.275f, 0.5f, 0.725f, 0.95f};
-    const float radius = 0.3f;
-    const float step = 0.9f;
-    
-    for (int i = 0; i < 5; i++) {
-        auto ball = std::make_shared<Entity>(
-            "meshes/ball.obj",
-            create_material(param_values[i]),
-            glm::scale(
-                glm::translate(glm::mat4(1.0f), 
-                    glm::vec3(x_position, radius + i * step - 1.5, 0)),
-                glm::vec3(radius)
-            )
-        );
-        scene->AddEntity(ball);
-    }
-}
-// IOR专用函数
-void AddIORTestColumn(
-    std::unique_ptr<Scene>& scene,
-    const glm::vec3& base_color,
-    float x_position
-) {
-    const float ior_values[5] = {1.05f, 1.3f, 1.55f, 1.8f, 2.0f};
-    const float radius = 0.3f;
-    const float step = 0.9f;
-    
-    for (int i = 0; i < 5; i++) {
-        auto ball = std::make_shared<Entity>(
-            "meshes/ball.obj",
-            Material(
-                base_color,
-                0.1f,  // roughness - 光滑表面
-                0.0f,  // metallic - 电介质
-                0xFFFFFFFF, glm::vec3(0.0f),
-                ior_values[i],  // IOR
-                0.9f,  // transparency - 高透明
-                -1, -1, -1,
-                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f
-            ),
-            glm::scale(
-                glm::translate(glm::mat4(1.0f), 
-                    glm::vec3(x_position, radius + i * step - 1.5, 0)),
-                glm::vec3(radius)
-            )
-        );
-        scene->AddEntity(ball);
-    }
-}
-
-// Emission专用函数
-void AddEmissionTestColumn(
-    std::unique_ptr<Scene>& scene,
-    const glm::vec3& base_color,
-    float x_position
-) {
-    const float emission_values[5] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
-    const float radius = 0.3f;
-    const float step = 0.9f;
-    
-    for (int i = 0; i < 5; i++) {
-        auto ball = std::make_shared<Entity>(
-            "meshes/ball.obj",
-            Material(
-                base_color * 0.3f,  // 暗base_color让emission更明显
-                0.5f,  // roughness
-                0.0f,  // metallic
-                0xFFFFFFFF,
-                base_color * emission_values[i],  // emission颜色与base_color成比例
-                1.0f, 0.0f, -1, -1, -1,
-                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f
-            ),
-            glm::scale(
-                glm::translate(glm::mat4(1.0f), 
-                    glm::vec3(x_position, radius + i * step - 1.5, 0)),
-                glm::vec3(radius)
-            )
-        );
-        scene->AddEntity(ball);
-    }
-}
-
-// Anisotropic专用函数（需要-1到1的范围）
-void AddAnisotropicTestColumn(
-    std::unique_ptr<Scene>& scene,
-    const glm::vec3& base_color,
-    float x_position
-) {
-    const float anisotropic_values[5] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
-    const float radius = 0.3f;
-    const float step = 0.9f;
-    
-    for (int i = 0; i < 5; i++) {
-        auto ball = std::make_shared<Entity>(
-            "meshes/ball.obj",
-            Material(
-                base_color,
-                0.15f,  // roughness - 低粗糙度才能看到各向异性
-                0.3f,  // metallic - 部分金属增强各向异性效果
-                0xFFFFFFFF, glm::vec3(0.0f), 1.0f, 0.0f, -1, -1, -1,
-                0.0f, 0.5f, 0.0f, anisotropic_values[i],  // anisotropic
-                0.0f, 0.0f, 0.0f, 0.0f, 
-                1.0f, 0.0f, 0.0f
-            ),
-            glm::scale(
-                glm::translate(glm::mat4(1.0f), 
-                    glm::vec3(x_position, radius + i * step - 1.5, 0)),
-                glm::vec3(radius)
-            )
-        );
-        scene->AddEntity(ball);
-    }
-}
-
-// 在 app.cpp 中，在 OnInit 之前添加以下函数
-
-void CreateLightColumn(
-    std::unique_ptr<Scene>& scene,
-    const glm::vec3& pass_through_point,  // 光柱经过的靠近原点的点
-    const glm::vec3& far_start,           // 远端起点
-    const glm::vec3& far_end,             // 远端终点
-    float column_thickness = 0.15f,       // 光柱粗细
-    const glm::vec3& emission_color = glm::vec3(1.0f, 1.0f, 1.0f),  // 纯白发光
-    float emission_intensity = 2.0f       // 发光强度
-) {
-    // 计算光柱方向（从远端起点到远端终点）
-    glm::vec3 direction = glm::normalize(pass_through_point - far_start);
-    
-    // 计算光柱总长度
-    float total_length = glm::length(far_end - far_start);
-    
-    // 创建发光材质
-    Material light_material(
-        glm::vec3(0.0f, 0.0f, 0.0f),  // base_color 为黑色，主要通过 emission 发光
-        0.5f,              // roughness
-        0.0f,              // metallic
-        0xFFFFFFFF,        // light_index (没有关联到 LightManager 的光源，作为纯几何自发光)
-        emission_color * emission_intensity / 3.5f,  // emission
-        1.005f,              // ior
-        0.5f,              // transparency
-        -1, -1, -1,        // texture ids
-        0.0f, 0.0f, 0.0f, 0.0f,  // subsurface, specular, specular_tint, anisotropic
-        0.0f, 0.0f, 0.0f, 0.0f,  // sheen, sheen_tint, clearcoat, clearcoat_roughness
-        1.0f, 0.0f, 0.0f   // A, B, C
-    );
-    
-    // 计算光柱中心位置（pass_through_point）
-    glm::vec3 center_position = pass_through_point;
-    
-    // 构建变换矩阵
-    // 1. 先沿 Y 轴拉伸（cube 默认方向）
-    glm::mat4 scale = glm::scale(
-        glm::mat4(1.0f),
-        glm::vec3(column_thickness, total_length, column_thickness)
-    );
-    
-    // 2. 旋转到目标方向
-    // cube 默认沿 Y 轴，需要将 Y 轴旋转到 direction
-    glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
-    glm::vec3 rotation_axis = glm::normalize(glm::cross(up, direction));
-    float rotation_angle = glm::acos(glm::clamp(glm::dot(up, direction), -1.0f, 1.0f));
-    glm::mat4 rotation;
-    if (glm::length(rotation_axis) > 0.001f) {
-        rotation = glm::rotate(glm::mat4(1.0f), rotation_angle, rotation_axis);
-    } else {
-        // 方向与 Y 轴平行或相反
-        if (direction.y < 0.0f) {
-            rotation = glm::rotate(glm::mat4(1.0f), glm::pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f));
-        } else {
-            rotation = glm::mat4(1.0f);
-        }
-    }
-    
-    // 3. 平移到中心位置
-    glm::mat4 translation = glm::translate(glm::mat4(1.0f), center_position);
-    
-    // 组合变换：先缩放，再旋转，最后平移
-    glm::mat4 transform = translation * rotation * scale;
-    
-    // 创建实体
-    auto light_column = std::make_shared<Entity>("meshes/cube.obj", light_material, transform);
-    scene->AddEntity(light_column);
-}
-
-void AddLightColumnsScene(std::unique_ptr<Scene>& scene) {
-    // 定义远端点
-    glm::vec3 far_start = glm::vec3(-35.0f, -50.0f, -20.0f);
-    glm::vec3 far_end = glm::vec3(50.0f, 50.0f, 50.0f);
-    
-    struct LightColumnParam {
-        glm::vec3 position;
-        float thickness;
-        float intensity;
-        glm::vec3 color; // 新增颜色字段
-    };
-
-    std::vector<LightColumnParam> light_columns = {
-        // === 近景光柱 === 
-        // 1. 粗主光柱 (红)
-        { glm::vec3(1.9f, 0.5f, 3.0f), 0.30f, 6.0f, glm::vec3(1.0f, 0.0f, 0.0f) },
-        
-        // 2. 细光柱 (橙)
-        { glm::vec3(-3.5f, 0.5f, 2.5f), 0.12f, 4.0f, glm::vec3(1.0f, 0.5f, 0.0f) },
-        
-        // === 中景光柱 ===
-        // 3. 右侧中景 (黄)
-        { glm::vec3(1.9f, 1.0f, 1.5f), 0.18f, 4.5f, glm::vec3(1.0f, 1.0f, 0.0f) },
-        
-        // 4. 左侧中景 (绿)
-        { glm::vec3(-3.0f, 0.0f, 1.0f), 0.15f, 4.0f, glm::vec3(0.0f, 1.0f, 0.0f) },
-        
-        // === 远景光柱 ===
-        // 5. 中心远景 (青)
-        { glm::vec3(-0.3f, 1.5f, 0.5f), 0.12f, 3.5f, glm::vec3(0.0f, 1.0f, 1.0f) },
-        
-        // 6. 左后方远景 (蓝)
-        { glm::vec3(-1.5f, 1.0f, -0.5f), 0.08f, 3.5f, glm::vec3(0.0f, 0.0f, 1.0f) },
-        
-        // 7. 最远的光柱 (紫)
-        { glm::vec3(0.4f, -0.5f, -1.0f), 0.06f, 3.0f, glm::vec3(0.5f, 0.0f, 1.0f) },
-    };
-
-    // 创建所有光柱
-    for (const auto& col : light_columns) {
-        CreateLightColumn(scene, col.position, far_start, far_end, 
-                        col.thickness, col.color, col.intensity); // 使用结构体中的颜色
-    }
-}
-
-
 
 void Application::OnInit() {
     alive_ = true;
@@ -629,31 +377,22 @@ void Application::OnInit() {
     mouse_x_ = 0.0;
     mouse_y_ = 0.0;
     
-    // 创建场景
     scene_ = std::make_unique<Scene>(core_.get());
 
 
-    //初始化TextureManager
+    // Initialize TextureManager
     texture_manager_ = std::make_unique<TextureManager>(core_.get());
-    //测试纹理
-    // int colorTexId = texture_manager_->LoadTexture("textures/food_pomegranate_01_diff_4k.jpg");
-    // int normalTexId=texture_manager_->LoadTexture("textures/food_pomegranate_01_nor_gl_4k.exr");
-    // int normalTexId = -1;
-    // int attributeTexId=texture_manager_->LoadTexture("textures/food_pomegranate_01_rough_4k.jpg");
-    //HDR
     try {
         skybox_texture_id_ = texture_manager_->LoadHDRTexture("textures/skybox", 
                                                             MUL_INTENS_SKYBOX); // set in light.h
         enable_skybox_ = true;
-        // skybox_intensity_ = 1.0f;
-        // skybox_rotation_ = 0.0f;
         grassland::LogInfo("HDR Skybox loaded successfully");
     } catch (const std::exception& e) {
         grassland::LogWarning("Failed to load HDR skybox: {}. Using gradient sky.", e.what());
         enable_skybox_ = false;
         skybox_texture_id_ = -1;
     }
-    // 创建Sampler
+    // Create sampler
     grassland::graphics::SamplerInfo sampler_desc;
     sampler_desc.min_filter = grassland::graphics::FILTER_MODE_LINEAR;
     sampler_desc.mag_filter = grassland::graphics::FILTER_MODE_LINEAR;
@@ -663,34 +402,33 @@ void Application::OnInit() {
     core_->CreateSampler(sampler_desc, &sampler_);
 
 
-    // 初始化光源管理器
+    // Initialize light manager
     light_manager_ = std::make_unique<LightManager>();
     light_manager_->Initialize(core_.get(), scene_.get());
     light_manager_->SetHDRPower( texture_manager_->GetHDRTotalLuminance(skybox_texture_id_) );
     
-    // 添加默认光源
+    // Create default lights
     light_manager_->CreateDefaultLights();
 
 
-    // 创建介质
     std::vector<MediumParams> media_cpu;
 
     MediumParams milk{};
-    milk.sigma_a = glm::vec3(0.5f, 0.7f, 1.0f);   // 吸收
-    milk.sigma_s = glm::vec3(3.0f, 3.0f, 3.0f);   // 散射
-    milk.Le      = glm::vec3(0.0f);              // 自发光
+    milk.sigma_a = glm::vec3(0.5f, 0.7f, 1.0f);  
+    milk.sigma_s = glm::vec3(3.0f, 3.0f, 3.0f); 
+    milk.Le      = glm::vec3(0.0f);              
     milk.enabled = 1;
 
     media_cpu.push_back(milk);
 
-    // 创建 GPU buffer
+    // Create GPU buffer
     core_->CreateBuffer(media_cpu.size() * sizeof(MediumParams),grassland::graphics::BUFFER_TYPE_DYNAMIC, &media_buffer_);
     media_buffer_->UploadData(media_cpu.data(),media_cpu.size() * sizeof(MediumParams));
 
     grassland::LogInfo("Medium buffer initialized with {} media.", media_cpu.size());
 
 
-    // 初始化渲染设置
+    // Initialize render settings
     core_->CreateBuffer(sizeof(RenderSettings), grassland::graphics::BUFFER_TYPE_DYNAMIC, &render_settings_buffer_);
     
     RenderSettings initial_settings{};
@@ -704,64 +442,56 @@ void Application::OnInit() {
     render_settings_buffer_->UploadData(&initial_settings, sizeof(RenderSettings));
 
 
-    // // 添加实体
-    // {
-    //     int colorTexId = texture_manager_->LoadTexture("textures/grid.png");
-    //     auto ground = std::make_shared<Entity>(
-    //         "meshes/cube.obj",
-    //         Material(glm::vec3(1.0f, 0.8f, 0.88f), 0.9f, 0.0f,
-    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, colorTexId, -1, -1, 0.0, 0.6
-    //         // Material(glm::vec3(0.8f, 0.8f, 0.8f), 0.15f, 0.5f,
-    //         // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.9
-    //     ),
-    //         glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.8f, 0.0f)), 
-    //                   glm::vec3(10.0f, 0.1f, 10.0f))
-    //     );
-    //     scene_->AddEntity(ground);
-    // }
+    // Add entities
+    {
+        int colorTexId = texture_manager_->LoadTexture("textures/grid.png");
+        auto ground = std::make_shared<Entity>(
+            "meshes/cube.obj",
+            Material(glm::vec3(1.0f, 0.8f, 0.88f), 0.9f, 0.0f,
+            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, colorTexId, -1, -1, 0.0, 0.6
+        ),
+            glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.8f, 0.0f)), 
+                      glm::vec3(10.0f, 0.1f, 10.0f))
+        );
+        scene_->AddEntity(ground);
+    }
 
-    // {
-    //     auto red_sphere = std::make_shared<Entity>(
-    //         "meshes/octahedron.obj",
-    //         Material(glm::vec3(0.99f, 0.3f, 0.2f), 0.06f, 0.4f,
-    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1.1, 0.0, -1, -1, -1, 0.0, 0.8, 0.1, 0.0, 0.0, 0.0
+    {
+        auto red_sphere = std::make_shared<Entity>(
+            "meshes/octahedron.obj",
+            Material(glm::vec3(0.99f, 0.3f, 0.2f), 0.06f, 0.4f,
+            0xFFFFFFFF, glm::vec3(0, 0, 0), 1.1, 0.0, -1, -1, -1, 0.0, 0.8, 0.1, 0.0, 0.0, 0.0
+        ),
+                glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
+        );
+        scene_->AddEntity(red_sphere);
+    }
 
-    //         // Material(glm::vec3(0.95f, 0.0f, 0.0f), 0.4f, 0.1f,
-    //         // 0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, 0.0, 0.2, 0.1, 0.0, 0.0, 0.0, 1.0, 0.1
-    //     ),
-    //             glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.5f, 0.0f))
-    //     );
-    //     scene_->AddEntity(red_sphere);
-    // }
+    {
+        auto green_sphere = std::make_shared<Entity>(
+            "meshes/preview_sphere.obj",
+            Material(glm::vec3(0.85f, 0.85f, 0.85f), 0.1f, 0.7f,
+            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1, 0.0, 0.9, 0.1, 0.0
+        ),
+                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
+        );
+        scene_->AddEntity(green_sphere);
+    }
 
-    // {
-    //     auto green_sphere = std::make_shared<Entity>(
-    //         "meshes/preview_sphere.obj",
-    //         Material(glm::vec3(0.85f, 0.85f, 0.85f), 0.1f, 0.7f,
-    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1, 0.0, 0.9, 0.1, 0.0
-    //             ),
-    //         // Material(glm::vec3(0.8f, 0.95f, 0.8f), 0.2f, 0.0f),
-    //             glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f))
-    //     );
-    //     scene_->AddEntity(green_sphere);
-    // }
-
-    // {
-    //     auto blue_cube = std::make_shared<Entity>(
-    //         "meshes/cube.obj",
-    //         Material(glm::vec3(0.2f, 0.2f, 1.0f), 0.4f, 0.2f,
-    //         0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1
-    //     ),
-    //         glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.5f, 0.0f))
-    //     );
-    //     scene_->AddEntity(blue_cube);
-    // }
-
-    AddLightColumnsScene(scene_);
+    {
+        auto blue_cube = std::make_shared<Entity>(
+            "meshes/cube.obj",
+            Material(glm::vec3(0.2f, 0.2f, 1.0f), 0.4f, 0.2f,
+            0xFFFFFFFF, glm::vec3(0, 0, 0), 1, 0.0, -1, -1, -1
+        ),
+            glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.5f, 0.0f))
+        );
+        scene_->AddEntity(blue_cube);
+    }
 
     scene_->BuildAccelerationStructures();
 
-    // 创建film
+    // Create film
     film_ = std::make_unique<Film>(core_.get(), window_->GetWidth(), window_->GetHeight());
 
     core_->CreateBuffer(sizeof(CameraObject), grassland::graphics::BUFFER_TYPE_DYNAMIC, &camera_object_buffer_);
@@ -771,25 +501,13 @@ void Application::OnInit() {
     initial_hover.hovered_entity_id = -1;
     hover_info_buffer_->UploadData(&initial_hover, sizeof(HoverInfo));
 
-    // 初始化相机状态
-    camera_pos_ = glm::vec3{ -1.7f, -0.3f, 4.50f };
+    // Initialize camera state
+    camera_pos_ = glm::vec3{ 0.0f, 1.0f, 3.5f };
     camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
-    camera_speed_ = 0.08f;
+    camera_speed_ = 0.1f;
 
-    yaw_ = -95.8f;
-    pitch_ = -26.3f;
-    // camera_pos_ = glm::vec3{ -1.4f, -0.3f, 1.3f };
-    // camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
-    // camera_speed_ = 0.1f;
-
-    // yaw_ = -90.0f;
-    // pitch_ = 0.0f;
-    // camera_pos_ = glm::vec3{ 0.0f, 1.0f, 3.5f };
-    // camera_up_ = glm::vec3{ 0.0f, 1.0f, 0.0f };
-    // camera_speed_ = 0.1f;
-
-    // yaw_ = -90.0f;
-    // pitch_ = 0.0f;
+    yaw_ = -90.0f;
+    pitch_ = 0.0f;
     last_x_ = (float)window_->GetWidth() / 2.0f;
     last_y_ = (float)window_->GetHeight() / 2.0f;
     mouse_sensitivity_ = 0.1f;
@@ -808,7 +526,7 @@ void Application::OnInit() {
     camera_object.camera_to_world =
         glm::inverse(glm::lookAt(camera_pos_, camera_pos_ + camera_front_, camera_up_));
 
-    camera_object.focal_distance = focal_distance_; // add Depth field parameters
+    camera_object.focal_distance = focal_distance_;
     camera_object.aperture_size = aperture_size_;
     camera_object.focal_length = focal_length_;
     camera_object.lens_radius = aperture_size_ * 0.5f;
@@ -848,19 +566,19 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space6 - accumulated color
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_WRITABLE_IMAGE, 1);          // space7 - accumulated samples
 
-    // 几何信息
+    // Geometry data
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space8 - geometry descriptors
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space9 - vertex infos 
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space10 - indices    
 
-    // 渲染设置
+    // Render settings
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_UNIFORM_BUFFER, 1);          // space11 - render setting
     
-    // 光源数据
+    // Light data
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space12 - lights buffer
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space13 - light power weights    
     
-    //Motion blur
+    // Motion blur
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space14 - motion groups buffer
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_ACCELERATION_STRUCTURE, 1);  // space15 - new AS
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_ACCELERATION_STRUCTURE, 1);  // space16 - new AS
@@ -871,7 +589,7 @@ void Application::OnInit() {
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_SAMPLER, 1);                 // space19 - sampler
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space20 - hdr_cdf_buffer
 
-    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_IMAGE, 2048);                 // space21 - mip atlas images
+    program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_IMAGE, 2048);                // space21 - mip atlas images
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space22 - mip info buffer
     program_->AddResourceBinding(grassland::graphics::RESOURCE_TYPE_STORAGE_BUFFER, 1);          // space23 - media buffer
 
@@ -1012,7 +730,7 @@ void Application::OnUpdate() {
         camera_object.lens_radius = aperture_size_ * 0.5f;
         camera_object.enable_depth_of_field = (depth_of_field_enabled_ && !camera_enabled_) ? 1 : 0;
         
-        // 运动模糊参数 - 新增
+        // Motion blur parameters
         camera_object.camera_linear_velocity = camera_linear_velocity_;
         camera_object.camera_angular_velocity = camera_angular_velocity_;
         camera_object.enable_motion_blur = (motion_blur_enabled_ && !camera_enabled_) ? 1 : 0;
@@ -1109,13 +827,12 @@ void Application::RenderInfoOverlay() {
 
     ImGui::Spacing();
     
-    // start of modification to Gui
     ImGui::SeparatorText("Depth of Field");
     ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "F Key: Toggle Depth of Field");
     
     if (ImGui::Button(depth_of_field_ui_open_ ? "Hide DOF Settings" : "Show DOF Settings")) {
         depth_of_field_ui_open_ = !depth_of_field_ui_open_;
-        // 当打开UI时，同步实际参数到临时参数
+        // Synchronize actual parameters to temporary parameters when UI opens
         if (depth_of_field_ui_open_) {
             temp_focal_distance_ = focal_distance_;
             temp_aperture_size_ = aperture_size_;
@@ -1126,7 +843,7 @@ void Application::RenderInfoOverlay() {
     if (depth_of_field_ui_open_) {
         ImGui::Indent();
         
-        // 启用/禁用景深
+        // Enable/disable depth of field
         bool dof_enabled = depth_of_field_enabled_;
         if (ImGui::Checkbox("Enable Depth of Field##dof_enable", &dof_enabled)) {
             depth_of_field_enabled_ = dof_enabled;
@@ -1137,7 +854,7 @@ void Application::RenderInfoOverlay() {
         }
         
         if (depth_of_field_enabled_) {
-            // 显示当前实际参数
+            // Display current actual parameters
             ImGui::Text("Current Values:");
             ImGui::Text("  Focus: %.2fm", focal_distance_);
             ImGui::Text("  Aperture: %.3fm (f/%.1f)", 
@@ -1147,18 +864,15 @@ void Application::RenderInfoOverlay() {
             ImGui::Spacing();
             ImGui::SeparatorText("New Values");
             
-            // 焦点距离输入框
             ImGui::Text("Focus Dis (m):");
             ImGui::SameLine();
             ImGui::PushItemWidth(120.0f);
             ImGui::InputFloat("##temp_focal_distance", &temp_focal_distance_, 0.0f, 0.0f, "%.2f");
             ImGui::PopItemWidth();
             
-            // 显示范围提示
             ImGui::SameLine();
             ImGui::TextDisabled("[0.05, 500.0]");
             
-            // 光圈大小输入框
             ImGui::Text("Aperture Size (m):");
             ImGui::SameLine();
             ImGui::PushItemWidth(120.0f);
@@ -1168,7 +882,6 @@ void Application::RenderInfoOverlay() {
             float temp_f_stop = temp_focal_length_ / temp_aperture_size_;
             ImGui::TextDisabled("(f/%.1f)", temp_f_stop);
             
-            // 焦距输入框
             ImGui::Text("Focal Length (mm):");
             ImGui::SameLine();
             ImGui::PushItemWidth(120.0f);
@@ -1178,13 +891,11 @@ void Application::RenderInfoOverlay() {
             }
             ImGui::PopItemWidth();
             
-            // 显示视角信息
             float sensor_width = 0.036f;
             float fov = 2.0f * atan(sensor_width / (2.0f * temp_focal_length_));
             ImGui::SameLine();
             ImGui::TextDisabled("%.1f°", glm::degrees(fov));
             
-            // 参数验证
             bool params_valid = true;
             std::string error_msg;
             
@@ -1199,16 +910,13 @@ void Application::RenderInfoOverlay() {
                 error_msg = "Focal length must be between 10 and 2000mm";
             }
             
-            // 显示错误信息
             if (!params_valid) {
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "%s", error_msg.c_str());
             }
             
-            // Set按钮
             ImGui::Spacing();
             ImGui::BeginGroup();
             
-            // 禁用无效参数的Set按钮
             ImGui::BeginDisabled(!params_valid);
             
             if (ImGui::Button("Set##dof_set", ImVec2(80, 30))) {
@@ -1219,7 +927,6 @@ void Application::RenderInfoOverlay() {
             
             ImGui::SameLine();
             
-            // Reset按钮 - 重置为当前实际值
             if (ImGui::Button("Reset##dof_reset", ImVec2(80, 30))) {
                 temp_focal_distance_ = focal_distance_;
                 temp_aperture_size_ = aperture_size_;
@@ -1228,7 +935,6 @@ void Application::RenderInfoOverlay() {
             
             ImGui::SameLine();
             
-            // Default按钮
             if (ImGui::Button("Default##dof_default", ImVec2(80, 30))) {
                 temp_focal_distance_ = 5.0f;
                 temp_aperture_size_ = 0.1f;
@@ -1237,7 +943,6 @@ void Application::RenderInfoOverlay() {
             
             ImGui::EndGroup();
             
-            // 滚轮控制提示
             ImGui::Spacing();
             ImGui::SeparatorText("Controls");
             ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Mouse Wheel: Adjust focus distance in real-time");
@@ -1246,10 +951,6 @@ void Application::RenderInfoOverlay() {
         
         ImGui::Unindent();
     }
-
-    // end of modification
-
-    // start of modification
 
     ImGui::Spacing();
     ImGui::SeparatorText("Motion Blur");
@@ -1267,7 +968,7 @@ void Application::RenderInfoOverlay() {
     if (motion_blur_ui_open_) {
         ImGui::Indent();
         
-        // 启用/禁用运动模糊
+        // Enable/disable motion blur
         bool mb_enabled = motion_blur_enabled_;
         if (ImGui::Checkbox("Enable Motion Blur##mb_enable", &mb_enabled)) {
             motion_blur_enabled_ = mb_enabled;
@@ -1278,7 +979,6 @@ void Application::RenderInfoOverlay() {
         }
         
         if (motion_blur_enabled_) {
-            // 显示当前实际参数
             ImGui::Text("Current Values:");
             ImGui::Text("  Exposure: %.3fs", exposure_time_);
             ImGui::Text("  Linear Vel: (%.2f, %.2f, %.2f) m/s", 
@@ -1288,7 +988,6 @@ void Application::RenderInfoOverlay() {
             ImGui::Spacing();
             ImGui::SeparatorText("New Values");
             
-            // 曝光时间输入
             ImGui::Text("Exposure Time (s):");
             ImGui::SameLine();
             ImGui::PushItemWidth(120.0f);
@@ -1297,7 +996,6 @@ void Application::RenderInfoOverlay() {
             ImGui::SameLine();
             ImGui::TextDisabled("[0.00, 2.00]");
             
-            // 相机线性速度输入
             ImGui::Text("Camera Linear Velocity:");
             ImGui::PushItemWidth(120.0f);
             ImGui::InputFloat3("##temp_camera_linear_velocity", &temp_camera_linear_velocity_[0], "%.2f");
@@ -1305,18 +1003,16 @@ void Application::RenderInfoOverlay() {
             ImGui::SameLine();
             ImGui::TextDisabled("m/s");
             
-            // 相机角速度输入
             ImGui::Text("Camera Angular Velocity:");
             ImGui::PushItemWidth(120.0f);
             float angular_velocity_degrees = glm::degrees(temp_camera_angular_velocity_);
             if (ImGui::InputFloat("##temp_camera_angular_velocity", &angular_velocity_degrees, 0.0f, 0.0f, "%.2f")) {
-                temp_camera_angular_velocity_ = glm::radians(angular_velocity_degrees); // 转换回弧度
+                temp_camera_angular_velocity_ = glm::radians(angular_velocity_degrees); // Convert back to radians
             }
             ImGui::PopItemWidth();
             ImGui::SameLine();
             ImGui::TextDisabled("deg/s");
             
-            // 参数验证
             bool params_valid = true;
             std::string error_msg;
             
@@ -1331,16 +1027,13 @@ void Application::RenderInfoOverlay() {
                 error_msg = "Camera angular velocity too high (max " + std::to_string(glm::degrees(10.0f)) + " deg/s)";
             }
             
-            // 显示错误信息
             if (!params_valid) {
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "%s", error_msg.c_str());
             }
             
-            // Set按钮
             ImGui::Spacing();
             ImGui::BeginGroup();
             
-            // 禁用无效参数的Set按钮
             ImGui::BeginDisabled(!params_valid);
             
             if (ImGui::Button("Set##mb_set", ImVec2(80, 30))) {
@@ -1351,7 +1044,6 @@ void Application::RenderInfoOverlay() {
             
             ImGui::SameLine();
             
-            // Reset按钮 - 重置为当前实际值
             if (ImGui::Button("Reset##mb_reset", ImVec2(80, 30))) {
                 temp_exposure_time_ = exposure_time_;
                 temp_camera_linear_velocity_ = camera_linear_velocity_;
@@ -1360,7 +1052,6 @@ void Application::RenderInfoOverlay() {
             
             ImGui::SameLine();
             
-            // Default按钮
             if (ImGui::Button("Default##mb_default", ImVec2(80, 30))) {
                 temp_exposure_time_ = 0.1f;
                 temp_camera_linear_velocity_ = glm::vec3(0.0f);
@@ -1369,7 +1060,6 @@ void Application::RenderInfoOverlay() {
             
             ImGui::EndGroup();
             
-            // 控制提示
             ImGui::Spacing();
             ImGui::SeparatorText("Controls");
             ImGui::Text("Input boxes require 'Set' button to apply changes");
@@ -1378,9 +1068,6 @@ void Application::RenderInfoOverlay() {
         ImGui::Unindent();
     }
 
-    // end of modification
-
-    // start of modification
     ImGui::Spacing();
     ImGui::SeparatorText("Dispersion");
     ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "D Key: Toggle Dispersion");
@@ -1393,7 +1080,6 @@ void Application::RenderInfoOverlay() {
             frame_count_ = 0;
         }
     }
-    // end of modification
 
     ImGui::SeparatorText("Scene");
     size_t entity_count = scene_->GetEntityCount();
@@ -1733,7 +1419,7 @@ void Application::OnRender() {
     for(int i = 0; i < texture_number; i++){
         texture_images.push_back(texture_manager_->GetTexture(i)->gpuImage.get());
     }
-    // 创建一个 1x1 的占位图像
+    // Create a 1x1 placeholder image
     std::shared_ptr<grassland::graphics::Image> dummyImage;
     core_->CreateImage(1, 1, grassland::graphics::IMAGE_FORMAT_R8G8B8A8_UNORM, &dummyImage);
     uint8_t pixel[4] = {0, 0, 0, 255};
@@ -1749,7 +1435,7 @@ void Application::OnRender() {
     std::vector<grassland::graphics::Image*> mip_images;
     texture_manager_->CollectMipImages(mip_images);
 
-    // 补齐到 2048
+    // Pad to 2048
     const int maxMipImages = 2048;
     if ((int)mip_images.size() < maxMipImages) {
         int pad = maxMipImages - (int)mip_images.size();
@@ -1763,7 +1449,7 @@ void Application::OnRender() {
 
     command_context->CmdBindResources(21, mip_images, grassland::graphics::BIND_POINT_RAYTRACING);
 
-    // mip info 索引表缓冲
+    // Mip info index table buffer
     grassland::graphics::Buffer* mip_info_buf = texture_manager_->GetOrCreateMipInfoBuffer();
     command_context->CmdBindResources(22, { mip_info_buf ? mip_info_buf : empty_buffer.get() }, grassland::graphics::BIND_POINT_RAYTRACING);
     
